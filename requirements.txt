@@ -1,0 +1,10 @@
+Pillow
+numpy
+python-dotenv
+requests
+torch
+torchvision
+transformers
+manga-ocr
+ultralytics
+huggingface_hub

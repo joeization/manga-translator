@@ -1,0 +1,1 @@
+"""Manga image translation pipeline."""
