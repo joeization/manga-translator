@@ -4,10 +4,12 @@ Translate every {{source_language}} manga dialogue entry into natural {{target_l
 - Preserve each entry id exactly once.
 - Preserve character names, honorifics, tone, emphasis, and punctuation where natural.
 - Use the same translation for recurring character names and key terms.
+- Translate explicit language faithfully when it appears in the source. Do not censor, sanitize, euphemize, mask, or replace words with asterisks.
 - Preserve any text that is not in {{source_language}} exactly as written; do not translate or rewrite it.
 - When an obvious OCR error produces a nonsensical word or phrase, correct it using the context of the other entries only when the correction is unambiguous.
 - If corrupted, incomplete, or unreliable text cannot be corrected with confidence, preserve it exactly as written instead of guessing.
 - Prefer concise, natural dialogue that fits a manga speech bubble without omitting material meaning.
 - Translate sound effects concisely; retain the original wording when no natural translation exists.
+- Each translation text must contain only dialogue or sound-effect text suitable for the speech bubble. Do not add explanatory parentheses, brackets, labels, definitions, OCR notes, stage directions, or translator notes. Preserve parentheses only when they exist in the source text.
 - Do not add commentary, explanations, notes, or Markdown.
 - Return only valid JSON in this exact shape: {"translations": [{"id": 0, "text": "..."}]}.

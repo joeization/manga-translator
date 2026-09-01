@@ -7,6 +7,7 @@ from dataclasses import dataclass
 class TextRegion:
     bbox: tuple[int, int, int, int]
     source_text: str
+    confidence: float = 1.0
     translated_text: str | None = None
     source_bbox: tuple[int, int, int, int] | None = None
     layout_bbox: tuple[int, int, int, int] | None = None
