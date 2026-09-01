@@ -59,12 +59,20 @@ Use `--show` to display results in memory without writing image files. When proc
 python main.py --dir path/to/manga --show --debug
 ```
 
+## Example Content License
+
+`example/ubunchu` contains *Ubunchu!* episode 1 by Hiroshi Seo (瀬尾浩史), originally published in *KANTAN UBUNTU!* by ASCII MEDIA WORKS Inc. The original Japanese license states that this work is available under [Creative Commons Attribution-NonCommercial 2.1 Japan](https://creativecommons.org/licenses/by-nc/2.1/jp/).
+
+You may copy, distribute, display, and create adaptations of this example, including translated output, only with attribution to Hiroshi Seo and for non-commercial use. See the included [Japanese license](example/ubunchu/license_ja.txt) and [English license text](example/ubunchu/license_en.txt). The Japanese license is the source document for the license designation; the bundled English text refers to BY-NC 3.0 and should be read as a reference translation.
+
+This example-content license does not define a license for this software project. No project-wide software license is currently included.
+
 ## Configuration
 
 All runtime settings are in `.env`:
 
 - `OLLAMA_HOST`, `OLLAMA_MODEL`: Local Ollama service and translation model.
-- `SOURCE_LANGUAGE`, `TARGET_LANGUAGE`: Source and target language codes.
+- `SOURCE_LANGUAGE`, `TARGET_LANGUAGE`: Source and target language labels passed directly to the translation prompt.
 - `TRANSLATION_PROMPT_FILE`: Translation rules file; defaults to `prompts/translation.txt`.
 - `OUTPUT_DIR`, `OUTPUT_FORMAT`, `OUTPUT_JPEG_QUALITY`: Output location and JPEG quality.
 - `FONT_PATH`, `FONT_SIZE`, `MAX_FONT_SIZE`, `MIN_FONT_SIZE`, `TEXT_PADDING`: Render font and sizing.
@@ -73,6 +81,35 @@ All runtime settings are in `.env`:
 - `PIPELINE_MODE`: `two-stage` uses text detection; `one-stage` uses bubble segmentation; `hybrid` combines both.
 - `YOLO_MODEL_PATH`, `YOLO_CONFIDENCE`, `BUBBLE_MODEL_PATH`, `BUBBLE_CONFIDENCE`: Detection and bubble-segmentation model settings.
 - `INPAINT_ENABLED`, `INPAINT_ENGINE`, and the remaining `BUBBLE_`, `TEXT_DARK_`, `WHITE_BACKGROUND_`, `INPAINT_`, and `MASK_` settings: Source-text removal behavior.
+
+### OCR Support
+
+The current OCR implementation uses MangaOCR, which is specialized for Japanese manga. Translating manga in other source languages or writing systems requires an OCR implementation trained for that language and an adapter that implements the project's OCR interface.
+
+### Language Labels
+
+Ollama does not define a fixed set of translation language codes. This application substitutes the values of `SOURCE_LANGUAGE` and `TARGET_LANGUAGE` directly into the translation prompt. Use clear [BCP 47 language tags](https://www.rfc-editor.org/rfc/bcp/bcp47.txt) where possible:
+
+| Language | Recommended tag |
+| --- | --- |
+| Japanese | `ja` |
+| English | `en` |
+| Traditional Chinese | `zh-Hant` |
+| Simplified Chinese | `zh-Hans` |
+| Korean | `ko` |
+| French | `fr` |
+| German | `de` |
+| Spanish | `es` |
+| Italian | `it` |
+| Portuguese | `pt` |
+| Russian | `ru` |
+
+For Japanese-to-Traditional-Chinese manga translation, use:
+
+```env
+SOURCE_LANGUAGE=ja
+TARGET_LANGUAGE=zh-Hant
+```
 
 ## Translation Rules
 
