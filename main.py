@@ -110,6 +110,7 @@ def main() -> int:
             settings.ollama_model,
             settings.source_language,
             settings.target_language,
+            settings.translation_prompt_path,
         )
         pipeline = MangaTranslationPipeline(
             MangaOCR(settings.ocr_model_dir, build_region_detector(settings)),

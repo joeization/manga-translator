@@ -1,5 +1,6 @@
 Pillow
 numpy
+opencv-python
 python-dotenv
 requests
 torch

@@ -28,23 +28,31 @@ class ImageViewer:
         canvas_window = canvas.create_window((0, 0), window=content, anchor="nw")
         photos: list[ImageTk.PhotoImage] = []
         pages = initial_images or []
+        rendered_width = 0
+
+        def render_page(image: Image.Image, width: int) -> None:
+            scale = min(1.0, width / image.width)
+            rendered = image if scale == 1 else image.resize((round(image.width * scale), round(image.height * scale)), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(rendered)
+            label = ttk.Label(content, image=photo)
+            label.image = photo
+            label.pack(fill="x")
+            photos.append(photo)
 
         def render_pages(_: object | None = None) -> None:
+            nonlocal rendered_width
             width = max(1, canvas.winfo_width())
+            if width == rendered_width:
+                return
             for child in content.winfo_children():
                 child.destroy()
             photos.clear()
             for image in pages:
-                scale = min(1.0, width / image.width)
-                rendered = image if scale == 1 else image.resize((round(image.width * scale), round(image.height * scale)), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(rendered)
-                label = ttk.Label(content, image=photo)
-                label.image = photo
-                label.pack(fill="x")
-                photos.append(photo)
+                render_page(image, width)
             content.update_idletasks()
             canvas.configure(scrollregion=canvas.bbox("all"))
             canvas.itemconfigure(canvas_window, width=width)
+            rendered_width = width
 
         content.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", render_pages)
@@ -54,12 +62,15 @@ class ImageViewer:
             updated = False
             while True:
                 try:
-                    pages.append(images.get_nowait())
+                    image = images.get_nowait()
+                    pages.append(image)
+                    render_page(image, max(1, canvas.winfo_width()))
                     updated = True
                 except Empty:
                     break
             if updated:
-                render_pages()
+                content.update_idletasks()
+                canvas.configure(scrollregion=canvas.bbox("all"))
             if not complete:
                 root.after(100, poll)
         poll()

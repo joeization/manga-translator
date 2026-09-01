@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import requests
 
@@ -12,11 +13,15 @@ class TranslationError(RuntimeError):
 
 
 class OllamaTranslator(Translator):
-    def __init__(self, host: str, model: str, source_language: str, target_language: str) -> None:
+    def __init__(self, host: str, model: str, source_language: str, target_language: str, prompt_path: Path) -> None:
         self._endpoint = f"{host.rstrip('/')}/api/chat"
         self._model = model
         self._source_language = source_language
         self._target_language = target_language
+        try:
+            self._system_prompt = prompt_path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise TranslationError(f"Could not read translation prompt file {prompt_path}: {error}") from error
 
     def translate(self, texts: list[str]) -> list[str]:
         if not texts:
@@ -29,7 +34,10 @@ class OllamaTranslator(Translator):
                     "model": self._model,
                     "stream": False,
                     "format": "json",
-                    "messages": [{"role": "user", "content": self._build_prompt(texts)}],
+                    "messages": [
+                        {"role": "system", "content": self._build_system_prompt()},
+                        {"role": "user", "content": self._build_input(texts)},
+                    ],
                 },
                 timeout=120,
             )
@@ -41,14 +49,17 @@ class OllamaTranslator(Translator):
         except (requests.RequestException, KeyError, TypeError, ValueError) as error:
             raise TranslationError(f"Ollama request to {self._endpoint} failed: {error}") from error
 
-    def _build_prompt(self, texts: list[str]) -> str:
-        entries = [{"id": index, "text": text} for index, text in enumerate(texts)]
+    def _build_system_prompt(self) -> str:
         return (
-            f"Translate every {self._source_language} manga dialogue entry into {self._target_language}. "
-            "Keep each id exactly once, retain dialogue tone, and do not add commentary. "
-            'Return only JSON: {"translations": [{"id": 0, "text": "..."}]}.\n'
-            f"Input: {json.dumps(entries, ensure_ascii=False)}"
+            self._system_prompt
+            .replace("{{source_language}}", self._source_language)
+            .replace("{{target_language}}", self._target_language)
         )
+
+    @staticmethod
+    def _build_input(texts: list[str]) -> str:
+        entries = [{"id": index, "text": text} for index, text in enumerate(texts)]
+        return f"Input: {json.dumps(entries, ensure_ascii=False)}"
 
     @staticmethod
     def _parse_response(content: str, expected_count: int) -> list[str]:
