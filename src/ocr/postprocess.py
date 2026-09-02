@@ -6,7 +6,7 @@ import numpy as np
 
 from src.models import TextRegion
 
-from .region_splitter import merge_contained_regions, resolve_overlapping_regions
+from .region_splitter import resolve_overlapping_regions
 
 
 @dataclass(frozen=True)

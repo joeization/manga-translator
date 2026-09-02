@@ -14,7 +14,7 @@ from src.renderer import MaskAwarePillowRenderer, OpenCVInkAnchorDetector, Pillo
 from src.translator import OllamaCorrector, OllamaTranslator
 from src.viewer import ImageViewer
 
-SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 DETAIL_LOGGERS = ("src.ocr.mangaocr", "src.ocr.baberuocr", "src.translator.ollama")
 
 

@@ -39,9 +39,12 @@ VERTICAL_PUNCTUATION_MAP = {
 }
 
 
+_VERTICAL_TRANS_TABLE = str.maketrans(VERTICAL_PUNCTUATION_MAP)
+
+
 def to_vertical_text(text: str) -> str:
     """Convert horizontal punctuation and brackets to vertical orientation symbols."""
-    return "".join(VERTICAL_PUNCTUATION_MAP.get(char, char) for char in text)
+    return text.translate(_VERTICAL_TRANS_TABLE) if text else ""
 
 
 class PillowRenderer(Renderer):

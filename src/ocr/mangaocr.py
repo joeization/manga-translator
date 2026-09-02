@@ -9,7 +9,7 @@ from PIL import Image
 
 from src.models import OCRResult
 
-from .region_splitter import crop_for_ocr, merge_contained_regions, resolve_overlapping_regions, split_text_regions
+from .region_splitter import crop_for_ocr, resolve_overlapping_regions, split_text_regions
 
 logger = logging.getLogger(__name__)
 
