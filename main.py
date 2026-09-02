@@ -44,7 +44,15 @@ def build_inpainter(settings: Settings):
             settings.bubble_clear_mode,
             settings.bubble_min_overlap,
             settings.bubble_border_width,
+            settings.text_bright_threshold,
+            settings.solid_fill_std_threshold,
         )
+    if settings.inpaint_engine == "lama":
+        from src.inpainting import LamaInpainter
+        lama_path = settings.lama_model_path
+        if lama_path is None:
+            raise RuntimeError("LAMA_MODEL_PATH must be set when INPAINT_ENGINE=lama")
+        return LamaInpainter(lama_path, settings.lama_device)
     raise RuntimeError(f"Unsupported INPAINT_ENGINE: {settings.inpaint_engine}")
 
 

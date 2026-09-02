@@ -40,24 +40,62 @@ def _mask_in_region(region: TextRegion) -> np.ndarray:
 
 
 def _find_blank_bands(projection: np.ndarray, min_gap_length: int, low_threshold: int = 2) -> list[tuple[int, int]]:
-    """Find contiguous interior blank bands in a 1D projection profile."""
+    """Find contiguous *interior* blank bands in a 1D projection profile.
+
+    A band is interior when it does not start at index 0 (i.e. there is ink on
+    both sides), ensuring we never split at the very edge of a region.
+    Trailing blank runs at the end of the projection are also ignored because
+    the loop exits without a flush step.
+    """
     bands: list[tuple[int, int]] = []
     start: int | None = None
-    n = len(projection)
     for idx, count in enumerate(projection):
-        is_blank = (count <= low_threshold)
+        is_blank = count <= low_threshold
         if is_blank and start is None:
             start = idx
         elif not is_blank and start is not None:
-            if start > 0 and idx < n and (idx - start) >= min_gap_length:
+            if start > 0 and (idx - start) >= min_gap_length:
                 bands.append((start, idx))
             start = None
     return bands
 
 
+def _valid_split_points(bands: list[tuple[int, int]], total: int, min_sub_size: int) -> list[int]:
+    """Return midpoints of *bands* such that every resulting sub-segment is at
+    least *min_sub_size* pixels wide.
+
+    Bands are processed left-to-right; a candidate midpoint is kept only when
+    the segment before it (since the last accepted point) is large enough.
+    A final pass drops the last accepted point if it would leave a trailing
+    segment that is too short.
+    """
+    kept: list[int] = []
+    prev = 0
+    for start, end in bands:
+        pt = (start + end) // 2
+        if pt - prev >= min_sub_size:
+            kept.append(pt)
+            prev = pt
+    if kept and total - kept[-1] < min_sub_size:
+        kept.pop()
+    return kept
+
+
 def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.ndarray | None = None) -> list[TextRegion]:
     """Projection-profile based region splitter.
-    Splits ONLY when clear large interior blank gaps exist between distinct speech bubbles or paragraphs.
+
+    Splits only when clear large interior blank gaps exist between distinct
+    speech bubbles or paragraphs.
+
+    Strategy
+    --------
+    1. Attempt a Y-axis (horizontal) split using row-ink projection.
+    2. For every Y sub-region, independently attempt an X-axis (vertical)
+       split using column-ink projection.
+
+    This replaces the old mutual-exclusion (``elif``) logic, allowing a wide
+    region that contains e.g. two bubble rows – each with side-by-side bubbles –
+    to be correctly segmented on both axes.
     """
     left, top, right, bottom = region.bbox
     h_region, w_region = bottom - top, right - left
@@ -72,9 +110,13 @@ def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.n
     _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     ink = np.where(bubble_mask, ink, 0).astype(np.uint8)
 
-    # Estimate median glyph dimensions via connected components
-    count, _, stats, _ = cv2.connectedComponentsWithStats(ink)
-    components = [(l, t, l + w, t + h) for l, t, w, h, area in stats[1:count] if area >= 4 and w >= 3 and h >= 3]
+    # Estimate median glyph dimensions via connected components.
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(ink)
+    components = [
+        (l, t, l + w, t + h)
+        for l, t, w, h, area in stats[1:n_labels]
+        if area >= 4 and w >= 3 and h >= 3
+    ]
     if len(components) < 2:
         return [region]
 
@@ -83,79 +125,152 @@ def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.n
     median_w = float(np.median(widths)) if widths else 30.0
     median_h = float(np.median(heights)) if heights else 30.0
 
-    # Single vertical speech bubble protection:
-    # Speech bubbles with w <= 150px (or w <= 2.5 * median_w) contain vertical lines of text side-by-side.
-    # Splitting along Y chops staggered vertical lines apart; thus Y-splitting is bypassed.
-    if w_region <= max(150, round(median_w * 2.5)):
+    # Vertical-bubble protection: a narrow region contains vertical text
+    # columns placed side-by-side.  Splitting along Y would chop staggered
+    # columns apart.  The threshold scales with actual median glyph width,
+    # replacing the old resolution-dependent 150 px hard-code.
+    if w_region <= round(median_w * 2.5):
         return [region]
 
     min_y_gap = max(30, round(median_h * 1.0))
     min_x_gap = max(30, round(median_w * 1.8))
+    min_sub_h = max(35, round(median_h * 1.6))
+    min_sub_w = max(35, round(median_w * 1.6))
 
     low_thresh_y = max(5, round(w_region * 0.05))
-    low_thresh_x = max(5, round(h_region * 0.05))
 
     row_sums = (ink > 0).sum(axis=1)
-    col_sums = (ink > 0).sum(axis=0)
+    y_pts_local = _valid_split_points(
+        _find_blank_bands(row_sums, min_gap_length=min_y_gap, low_threshold=low_thresh_y),
+        h_region,
+        min_sub_h,
+    )
 
-    y_blank_bands = _find_blank_bands(row_sums, min_gap_length=min_y_gap, low_threshold=low_thresh_y)
-    x_blank_bands = _find_blank_bands(col_sums, min_gap_length=min_x_gap, low_threshold=low_thresh_x)
+    # Build Y sub-regions together with their region-local ink slices.
+    if y_pts_local:
+        y_abs_bounds = [top] + [top + pt for pt in y_pts_local] + [bottom]
+        y_parts: list[tuple[TextRegion, np.ndarray]] = []
+        for i in range(len(y_abs_bounds) - 1):
+            sub_box = (left, y_abs_bounds[i], right, y_abs_bounds[i + 1])
+            lt, lb = y_abs_bounds[i] - top, y_abs_bounds[i + 1] - top
+            sub_ink = ink[lt:lb, :]
+            y_parts.append((
+                replace(region, bbox=sub_box, source_bbox=sub_box, ocr_mask=sub_ink.astype(bool)),
+                sub_ink,
+            ))
+    else:
+        y_parts = [(region, ink)]
 
-    # Filter Y blank bands: only split if all sub-regions are large enough (>= 35px or 1.6 * median_h)
-    min_sub_h = max(35, round(median_h * 1.6))
-    valid_y_bands = []
-    if y_blank_bands:
-        y_pts = [(s + e) // 2 for s, e in y_blank_bands]
-        bounds = [0] + y_pts + [h_region]
-        all_valid = True
-        for i in range(len(bounds) - 1):
-            if (bounds[i + 1] - bounds[i]) < min_sub_h:
-                all_valid = False
-                break
-        if all_valid:
-            valid_y_bands = y_blank_bands
+    # For each Y part, independently attempt an X-axis split.
+    result: list[TextRegion] = []
+    for y_sub, y_ink in y_parts:
+        ys_left, ys_top, ys_right, ys_bottom = y_sub.bbox
+        ys_h = ys_bottom - ys_top
 
-    if valid_y_bands:
-        y_split_points = [top + (s + e) // 2 for s, e in valid_y_bands]
-        y_bounds = [top] + y_split_points + [bottom]
-        sub_regions = []
-        for i in range(len(y_bounds) - 1):
-            sub_box = (left, y_bounds[i], right, y_bounds[i + 1])
-            sub_mask = ink[y_bounds[i] - top : y_bounds[i + 1] - top, :].astype(bool)
-            sub_regions.append(replace(region, bbox=sub_box, source_bbox=sub_box, ocr_mask=sub_mask))
-        return sub_regions
+        low_thresh_x = max(5, round(ys_h * 0.05))
+        col_sums = (y_ink > 0).sum(axis=0)
+        x_pts_local = _valid_split_points(
+            _find_blank_bands(col_sums, min_gap_length=min_x_gap, low_threshold=low_thresh_x),
+            ys_right - ys_left,
+            min_sub_w,
+        )
 
-    elif x_blank_bands:
-        x_split_points = [left + (s + e) // 2 for s, e in x_blank_bands]
-        x_bounds = [left] + x_split_points + [right]
-        sub_regions = []
-        for i in range(len(x_bounds) - 1):
-            sub_box = (x_bounds[i], top, x_bounds[i + 1], bottom)
-            sub_mask = ink[:, x_bounds[i] - left : x_bounds[i + 1] - left].astype(bool)
-            sub_regions.append(replace(region, bbox=sub_box, source_bbox=sub_box, ocr_mask=sub_mask))
-        return sub_regions
+        if x_pts_local:
+            x_abs_bounds = [ys_left] + [ys_left + pt for pt in x_pts_local] + [ys_right]
+            for i in range(len(x_abs_bounds) - 1):
+                sub_box = (x_abs_bounds[i], ys_top, x_abs_bounds[i + 1], ys_bottom)
+                ll, lr = x_abs_bounds[i] - ys_left, x_abs_bounds[i + 1] - ys_left
+                result.append(replace(y_sub, bbox=sub_box, source_bbox=sub_box, ocr_mask=y_ink[:, ll:lr].astype(bool)))
+        else:
+            result.append(y_sub)
 
-    return [region]
+    return result
 
 
-def merge_contained_regions(regions: list[TextRegion], *args, **kwargs) -> list[TextRegion]:
-    """Filter out smaller regions fully contained inside larger regions."""
+def merge_contained_regions(regions: list[TextRegion]) -> list[TextRegion]:
+    """Filter out regions whose bounding box is fully contained inside another."""
+    return resolve_overlapping_regions(regions, threshold=1.0)
+
+
+def resolve_overlapping_regions(regions: list[TextRegion], threshold: float = 1.0) -> list[TextRegion]:
+    """Remove or merge regions with substantial spatial overlap.
+
+    For each pair (A, B):
+    - If A is >= *threshold* fraction inside B and B is strictly larger: A is
+      *dominated* and removed.
+    - If A is >= *threshold* inside B and B is >= *threshold* inside A (symmetric
+      overlap): A and B are *merged* into their union bounding box.
+
+    - ``threshold=1.0`` only removes perfectly contained regions (original
+      strict-containment behaviour); no merging occurs.
+    - ``threshold=0.35`` removes any region where >= 35 % of its area is
+      covered by a strictly larger region, and merges equal-size regions whose
+      mutual overlap exceeds 35 %.
+    """
     if len(regions) <= 1:
         return regions
-    res: list[TextRegion] = []
-    for r in regions:
-        b1 = r.bbox
-        is_inside = False
-        for other in regions:
-            b2 = other.bbox
-            if b1 != b2 and b1[0] >= b2[0] and b1[1] >= b2[1] and b1[2] <= b2[2] and b1[3] <= b2[3]:
-                is_inside = True
+
+    n = len(regions)
+    areas = [max(1, (r.bbox[2] - r.bbox[0]) * (r.bbox[3] - r.bbox[1])) for r in regions]
+
+    def _overlap_frac(i: int, j: int) -> float:
+        il, it, ir, ib = regions[i].bbox
+        jl, jt, jr, jb = regions[j].bbox
+        inter = max(0, min(ir, jr) - max(il, jl)) * max(0, min(ib, jb) - max(it, jt))
+        return inter / areas[i]
+
+    # Union-find (merge groups).
+    parent = list(range(n))
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(x: int, y: int) -> None:
+        px, py = _find(x), _find(y)
+        if px != py:
+            parent[py] = px  # merge y's root into x's root
+
+    dominated: set[int] = set()
+
+    for i in range(n):
+        if i in dominated:
+            continue
+        for j in range(n):
+            if i == j or j in dominated:
+                continue
+            frac_i = _overlap_frac(i, j)
+            if frac_i < threshold:
+                continue
+            if areas[j] > areas[i]:
+                # j is strictly larger and covers >= threshold of i → i is dominated.
+                dominated.add(i)
                 break
-        if not is_inside:
-            res.append(r)
-    return res
+            # areas[j] <= areas[i]: check symmetric overlap.
+            if _overlap_frac(j, i) >= threshold:
+                _union(i, j)
 
+    # Group surviving regions by union-find root.
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        if i in dominated:
+            continue
+        root = _find(i)
+        groups.setdefault(root, []).append(i)
 
-def resolve_overlapping_regions(regions: list[TextRegion], *args, **kwargs) -> list[TextRegion]:
-    """Resolve contained regions."""
-    return merge_contained_regions(regions, *args, **kwargs)
+    result: list[TextRegion] = []
+    for members in groups.values():
+        if len(members) == 1:
+            result.append(regions[members[0]])
+        else:
+            # Merge into union bbox; carry over metadata from the highest-confidence member.
+            ml = min(regions[m].bbox[0] for m in members)
+            mt = min(regions[m].bbox[1] for m in members)
+            mr = max(regions[m].bbox[2] for m in members)
+            mb = max(regions[m].bbox[3] for m in members)
+            base = max(members, key=lambda m: regions[m].detection_confidence)
+            result.append(replace(regions[base], bbox=(ml, mt, mr, mb)))
+
+    return result

@@ -49,6 +49,10 @@ class Settings:
     bubble_clear_mode: str
     bubble_min_overlap: float
     bubble_border_width: int
+    text_bright_threshold: int
+    solid_fill_std_threshold: float
+    lama_model_path: Path | None
+    lama_device: str
 
     @classmethod
     def load(cls, project_root: Path) -> "Settings":
@@ -94,6 +98,10 @@ class Settings:
             bubble_clear_mode=_required_setting("BUBBLE_CLEAR_MODE").lower(),
             bubble_min_overlap=float(_required_setting("BUBBLE_MIN_OVERLAP")),
             bubble_border_width=int(_required_setting("BUBBLE_BORDER_WIDTH")),
+            text_bright_threshold=int(os.getenv("TEXT_BRIGHT_THRESHOLD", "220")),
+            solid_fill_std_threshold=float(os.getenv("SOLID_FILL_STD_THRESHOLD", "30")),
+            lama_model_path=_project_path(project_root, os.getenv("LAMA_MODEL_PATH")) if os.getenv("LAMA_MODEL_PATH") else None,
+            lama_device=os.getenv("LAMA_DEVICE", "cpu"),
         )
 
 
