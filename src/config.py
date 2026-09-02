@@ -88,7 +88,7 @@ class Settings:
             white_background_ratio=float(_required_setting("WHITE_BACKGROUND_RATIO")),
             inpaint_radius=int(_required_setting("INPAINT_RADIUS")),
             mask_dilation=int(_required_setting("MASK_DILATION")),
-            ocr_clear_padding=int(os.getenv("OCR_CLEAR_PADDING", "4")),
+            ocr_clear_padding=int(os.getenv("OCR_CLEAR_PADDING", "12")),
             bubble_padding=int(_required_setting("BUBBLE_PADDING")),
             bubble_close_kernel=int(_required_setting("BUBBLE_CLOSE_KERNEL")),
             bubble_clear_mode=_required_setting("BUBBLE_CLEAR_MODE").lower(),

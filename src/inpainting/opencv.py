@@ -47,38 +47,31 @@ class OpenCVInpainter(Inpainter):
         return Image.fromarray(pixels, mode="RGB")
 
     def _inpaint_region(self, pixels: np.ndarray, region: TextRegion) -> None:
-        expanded_region = replace(region, bbox=_expand_bbox(region.bbox, pixels.shape[1], pixels.shape[0], self._ocr_clear_padding))
-        left, top, right, bottom = expanded_region.bbox
+        padded_region = replace(region, bbox=_expand_bbox(region.bbox, pixels.shape[1], pixels.shape[0], self._ocr_clear_padding))
+        bubble = _existing_bubble(region) or self._bubble_segmenter.segment(Image.fromarray(pixels), padded_region) or self._find_bubble(pixels, padded_region)
+        if bubble is not None:
+            bubble_bbox, bubble_mask = bubble
+            region.layout_bbox = bubble_bbox
+            region.layout_mask = bubble_mask
+            inpaint_bbox = _clip_bbox(bubble_bbox, pixels.shape[1], pixels.shape[0])
+        else:
+            inpaint_bbox = padded_region.bbox
+
+        left, top, right, bottom = inpaint_bbox
         roi = pixels[top:bottom, left:right]
         if roi.size == 0:
             return
+        bubble_interior = (
+            _bubble_mask_in_region(inpaint_bbox, bubble_bbox, bubble_mask)
+            if bubble is not None
+            else np.ones(roi.shape[:2], dtype=bool)
+        )
 
-        gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
-        text_mask = np.where(gray <= self._dark_threshold, 255, 0).astype(np.uint8)
-        if self._mask_dilation:
-            kernel_size = self._mask_dilation * 2 + 1
-            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-            text_mask = cv2.dilate(text_mask, kernel, iterations=1)
-
-        if not np.any(text_mask):
-            return
-
-        bubble = _existing_bubble(expanded_region) or self._bubble_segmenter.segment(Image.fromarray(pixels), expanded_region) or self._find_bubble(pixels, expanded_region)
-        if bubble is not None:
-            bubble_bbox, bubble_mask = bubble
-            expanded_region.layout_bbox = bubble_bbox
-            expanded_region.layout_mask = bubble_mask
-            bubble_interior = _bubble_mask_in_region(expanded_region.bbox, bubble_bbox, bubble_mask)
-            if self._bubble_clear_mode == "interior" and np.any(bubble_interior):
-                roi[_inset_bubble_mask(bubble_interior, self._bubble_border_width)] = 255
-                return
-            bubble_text_mask = np.where(bubble_interior, text_mask, 0).astype(np.uint8)
-            if np.any(bubble_text_mask):
-                roi[bubble_text_mask > 0] = 255
-                return
-
-        self._clear_bbox_edge(text_mask)
-        pixels[top:bottom, left:right] = cv2.inpaint(roi, text_mask, self._inpaint_radius, cv2.INPAINT_TELEA)
+        final_mask = _foreground_mask(roi, bubble_interior, region.bbox, inpaint_bbox, self._dark_threshold, self._mask_dilation)
+        region.inpaint_bbox = inpaint_bbox
+        region.inpaint_mask = final_mask
+        if np.any(final_mask):
+            pixels[top:bottom, left:right] = cv2.inpaint(roi, final_mask.astype(np.uint8) * 255, self._inpaint_radius, cv2.INPAINT_TELEA)
 
     def _find_bubble(self, pixels: np.ndarray, region: TextRegion) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
         left, top, right, bottom = region.bbox
@@ -120,15 +113,6 @@ class OpenCVInpainter(Inpainter):
         filled_component = _fill_enclosed_holes(component)
         return (outer_left, outer_top, outer_right, outer_bottom), filled_component.astype(bool)
 
-    @staticmethod
-    def _clear_bbox_edge(mask: np.ndarray) -> None:
-        if min(mask.shape) > 2:
-            mask[0, :] = 0
-            mask[-1, :] = 0
-            mask[:, 0] = 0
-            mask[:, -1] = 0
-
-
 def _fill_enclosed_holes(component: np.ndarray) -> np.ndarray:
     outside = component.copy()
     flood_mask = np.zeros((component.shape[0] + 2, component.shape[1] + 2), dtype=np.uint8)
@@ -143,22 +127,6 @@ def _existing_bubble(region: TextRegion) -> tuple[tuple[int, int, int, int], np.
     return None
 
 
-def _inset_bubble_mask(mask: np.ndarray, border_width: int) -> np.ndarray:
-    if mask.size == 0 or not np.any(mask):
-        return np.zeros(mask.shape, dtype=bool)
-    if border_width <= 0:
-        return mask.astype(bool)
-    kernel_size = border_width * 2 + 1
-    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-    return cv2.erode(
-        mask.astype(np.uint8),
-        kernel,
-        iterations=1,
-        borderType=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    ).astype(bool)
-
-
 def _expand_bbox(bbox: tuple[int, int, int, int], image_width: int, image_height: int, padding: int) -> tuple[int, int, int, int]:
     left, top, right, bottom = bbox
     return (
@@ -167,6 +135,48 @@ def _expand_bbox(bbox: tuple[int, int, int, int], image_width: int, image_height
         min(image_width, right + padding),
         min(image_height, bottom + padding),
     )
+
+
+def _clip_bbox(bbox: tuple[int, int, int, int], image_width: int, image_height: int) -> tuple[int, int, int, int]:
+    left, top, right, bottom = bbox
+    return max(0, left), max(0, top), min(image_width, right), min(image_height, bottom)
+
+
+def _foreground_mask(
+    roi: np.ndarray,
+    allowed_mask: np.ndarray,
+    detected_bbox: tuple[int, int, int, int],
+    roi_bbox: tuple[int, int, int, int],
+    dark_threshold: int,
+    dilation: int,
+) -> np.ndarray:
+    background_pixels = _local_background_pixels(roi, allowed_mask, detected_bbox, roi_bbox)
+    background = np.median(background_pixels, axis=0)
+    color_distance = np.linalg.norm(roi.astype(np.float32) - background, axis=2)
+    reference_distance = np.linalg.norm(background_pixels.astype(np.float32) - background, axis=1)
+    contrast_threshold = max(20.0, float(np.median(reference_distance) + 3 * np.median(np.abs(reference_distance - np.median(reference_distance)))))
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    mask = np.logical_and(allowed_mask, np.logical_or(color_distance >= contrast_threshold, gray <= dark_threshold))
+    if dilation:
+        kernel_size = dilation * 2 + 1
+        mask = cv2.dilate(mask.astype(np.uint8), np.ones((kernel_size, kernel_size), dtype=np.uint8), iterations=1).astype(bool)
+        mask = np.logical_and(mask, allowed_mask)
+    return mask
+
+
+def _local_background_pixels(
+    roi: np.ndarray, allowed_mask: np.ndarray, detected_bbox: tuple[int, int, int, int], roi_bbox: tuple[int, int, int, int]
+) -> np.ndarray:
+    detected_mask = np.zeros(allowed_mask.shape, dtype=bool)
+    left = max(0, detected_bbox[0] - roi_bbox[0])
+    top = max(0, detected_bbox[1] - roi_bbox[1])
+    right = min(roi.shape[1], detected_bbox[2] - roi_bbox[0])
+    bottom = min(roi.shape[0], detected_bbox[3] - roi_bbox[1])
+    detected_mask[top:bottom, left:right] = True
+    background_pixels = roi[np.logical_and(allowed_mask, ~detected_mask)]
+    if len(background_pixels) < 16:
+        background_pixels = roi[allowed_mask]
+    return background_pixels if len(background_pixels) else roi.reshape(-1, 3)
 
 
 def _bubble_mask_in_region(

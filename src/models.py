@@ -13,6 +13,8 @@ class TextRegion:
     character_confidences: list[float] | None = None
     metadata: dict[str, object] | None = None
     ocr_mask: object | None = None
+    inpaint_bbox: tuple[int, int, int, int] | None = None
+    inpaint_mask: object | None = None
     translated_text: str | None = None
     source_bbox: tuple[int, int, int, int] | None = None
     layout_bbox: tuple[int, int, int, int] | None = None
