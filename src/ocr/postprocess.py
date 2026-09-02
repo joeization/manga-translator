@@ -6,6 +6,8 @@ import numpy as np
 
 from src.models import TextRegion
 
+from .region_splitter import merge_contained_regions, resolve_overlapping_regions
+
 
 @dataclass(frozen=True)
 class BubblePostprocessConfig:
@@ -56,7 +58,7 @@ def postprocess_bubbles(
         )
 
     results.extend(segmentation for index, segmentation in enumerate(segmentation_bubbles) if index not in matched_segmentation)
-    return sort_manga_reading_order(results)
+    return resolve_overlapping_regions(results, threshold=0.35)
 
 
 def sort_manga_reading_order(regions: list[TextRegion]) -> list[TextRegion]:
@@ -185,18 +187,45 @@ def _merge_bboxes(candidates: list[TextRegion]) -> TextRegion:
 
 
 def _merge_masks(candidates: list[TextRegion]) -> TextRegion:
-    left = min(candidate.bbox[0] for candidate in candidates)
-    top = min(candidate.bbox[1] for candidate in candidates)
-    right = max(candidate.bbox[2] for candidate in candidates)
-    bottom = max(candidate.bbox[3] for candidate in candidates)
-    mask = np.zeros((bottom - top, right - left), dtype=bool)
+    if len(candidates) == 1:
+        return candidates[0]
+
+    left = min(c.bbox[0] for c in candidates)
+    top = min(c.bbox[1] for c in candidates)
+    right = max(c.bbox[2] for c in candidates)
+    bottom = max(c.bbox[3] for c in candidates)
+
+    layout_boxes = [c.layout_bbox for c in candidates if isinstance(c.layout_mask, np.ndarray) and c.layout_bbox is not None]
+    if layout_boxes:
+        l_left = min(b[0] for b in layout_boxes)
+        l_top = min(b[1] for b in layout_boxes)
+        l_right = max(b[2] for b in layout_boxes)
+        l_bottom = max(b[3] for b in layout_boxes)
+        mask_bbox = (min(left, l_left), min(top, l_top), max(right, l_right), max(bottom, l_bottom))
+    else:
+        mask_bbox = (left, top, right, bottom)
+
+    m_left, m_top, m_right, m_bottom = mask_bbox
+    mask = np.zeros((m_bottom - m_top, m_right - m_left), dtype=bool)
+
     for candidate in candidates:
         if not isinstance(candidate.layout_mask, np.ndarray) or candidate.layout_bbox is None:
             continue
-        candidate_left, candidate_top, candidate_right, candidate_bottom = candidate.layout_bbox
-        mask[candidate_top - top : candidate_bottom - top, candidate_left - left : candidate_right - left] |= candidate.layout_mask
-    bbox = (left, top, right, bottom)
-    return TextRegion(bbox=bbox, source_text="", detection_confidence=max(candidate.detection_confidence for candidate in candidates), layout_bbox=bbox, layout_mask=mask)
+        c_left, c_top, c_right, c_bottom = candidate.layout_bbox
+        mask_h, mask_w = candidate.layout_mask.shape[:2]
+        h = min(c_bottom - c_top, mask_h)
+        w = min(c_right - c_left, mask_w)
+        d_top = max(0, c_top - m_top)
+        d_left = max(0, c_left - m_left)
+        mask[d_top : d_top + h, d_left : d_left + w] |= candidate.layout_mask[:h, :w]
+
+    return TextRegion(
+        bbox=(left, top, right, bottom),
+        source_text="",
+        detection_confidence=max(c.detection_confidence for c in candidates),
+        layout_bbox=mask_bbox,
+        layout_mask=mask,
+    )
 
 
 def _mask_iou(first: TextRegion, second: TextRegion) -> float:

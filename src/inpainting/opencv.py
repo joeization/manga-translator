@@ -150,13 +150,19 @@ def _foreground_mask(
     dark_threshold: int,
     dilation: int,
 ) -> np.ndarray:
+    if not np.any(allowed_mask):
+        return np.zeros(roi.shape[:2], dtype=bool)
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    dark_pixels = np.logical_and(allowed_mask, gray <= dark_threshold)
+    if not np.any(dark_pixels) and np.all(roi[allowed_mask] >= 240):
+        return np.zeros(roi.shape[:2], dtype=bool)
+
     background_pixels = _local_background_pixels(roi, allowed_mask, detected_bbox, roi_bbox)
     background = np.median(background_pixels, axis=0)
     color_distance = np.linalg.norm(roi.astype(np.float32) - background, axis=2)
     reference_distance = np.linalg.norm(background_pixels.astype(np.float32) - background, axis=1)
     contrast_threshold = max(20.0, float(np.median(reference_distance) + 3 * np.median(np.abs(reference_distance - np.median(reference_distance)))))
-    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
-    mask = np.logical_and(allowed_mask, np.logical_or(color_distance >= contrast_threshold, gray <= dark_threshold))
+    mask = np.logical_and(allowed_mask, np.logical_or(color_distance >= contrast_threshold, dark_pixels))
     if dilation:
         kernel_size = dilation * 2 + 1
         mask = cv2.dilate(mask.astype(np.uint8), np.ones((kernel_size, kernel_size), dtype=np.uint8), iterations=1).astype(bool)

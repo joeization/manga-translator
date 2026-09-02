@@ -9,7 +9,7 @@ from PIL import Image
 
 from src.models import OCRResult
 
-from .region_splitter import crop_for_ocr, split_text_regions
+from .region_splitter import crop_for_ocr, merge_contained_regions, resolve_overlapping_regions, split_text_regions
 
 logger = logging.getLogger(__name__)
 
@@ -24,15 +24,31 @@ class MangaOCR:
 
     def detect(self, image: Image.Image) -> list[OCRResult]:
         engine = self._get_engine()
-        regions: list[OCRResult] = []
-        for candidate in self._detector.detect(image):
+        import numpy as np
+
+        image_array = np.asarray(image.convert("RGB"))
+        candidates = self._detector.detect(image)
+        all_split_regions: list[OCRResult] = []
+        for candidate in candidates:
             region = candidate if isinstance(candidate, OCRResult) else OCRResult(bbox=candidate, source_text="")
-            for text_region in split_text_regions(image, region):
-                text = engine(crop_for_ocr(image, text_region)).strip()
-                if text:
-                    text_region.source_text = text
-                    logger.info("MangaOCR result: %s (confidence: unavailable)", text)
-                    regions.append(text_region)
+            all_split_regions.extend(split_text_regions(image, region, image_array=image_array))
+
+        all_split_regions = resolve_overlapping_regions(all_split_regions, threshold=0.35)
+        if not all_split_regions:
+            return []
+
+        crops = [crop_for_ocr(image, text_region) for text_region in all_split_regions]
+        results = engine(crops)
+        if isinstance(results, str):
+            results = [results]
+
+        regions: list[OCRResult] = []
+        for text_region, text in zip(all_split_regions, results, strict=True):
+            clean_text = text.strip() if text else ""
+            if clean_text:
+                text_region.source_text = clean_text
+                logger.info("MangaOCR result: %s (confidence: unavailable)", clean_text)
+                regions.append(text_region)
         return regions
 
     def _get_engine(self):

@@ -15,7 +15,7 @@ from src.models import OCRResult
 from .baberu.configuration_baberu import BaberuOCRConfig
 from .baberu.modeling_baberu import BaberuOCRModel
 from .baberu.tokenization_baberu import BaberuTokenizer
-from .region_splitter import crop_for_ocr, split_text_regions
+from .region_splitter import crop_for_ocr, merge_contained_regions, resolve_overlapping_regions, split_text_regions
 
 logger = logging.getLogger(__name__)
 
@@ -56,25 +56,33 @@ class BaberuOCR:
 
     def detect(self, image: Image.Image) -> list[OCRResult]:
         self._get_engine()
-        regions: list[OCRResult] = []
-        for candidate in self._detector.detect(image):
+        import numpy as np
+
+        image_array = np.asarray(image.convert("RGB"))
+        candidates = self._detector.detect(image)
+        all_split_regions: list[OCRResult] = []
+        for candidate in candidates:
             region = candidate if isinstance(candidate, OCRResult) else OCRResult(bbox=candidate, source_text="")
-            for text_region in split_text_regions(image, region):
-                text, character_confidences = self._recognize(crop_for_ocr(image, text_region))
-                text, character_confidences = _strip_text_and_confidences(text, character_confidences)
-                if text:
-                    text_region.source_text = text
-                    text_region.character_confidences = character_confidences
-                    if character_confidences is not None:
-                        text_region.confidence = _sentence_confidence(character_confidences)
-                        text_region.metadata = {"confidence_type": "geometric_mean_generated_token_probability"}
-                    logger.info(
-                        "Baberu OCR result: %s (confidence: %s, character confidences: %s)",
-                        text,
-                        f"{text_region.confidence:.4f}" if text_region.confidence is not None else "unavailable",
-                        character_confidences if character_confidences is not None else "unavailable",
-                    )
-                    regions.append(text_region)
+            all_split_regions.extend(split_text_regions(image, region, image_array=image_array))
+
+        all_split_regions = resolve_overlapping_regions(all_split_regions, threshold=0.35)
+        regions: list[OCRResult] = []
+        for text_region in all_split_regions:
+            text, character_confidences = self._recognize(crop_for_ocr(image, text_region))
+            text, character_confidences = _strip_text_and_confidences(text, character_confidences)
+            if text:
+                text_region.source_text = text
+                text_region.character_confidences = character_confidences
+                if character_confidences is not None:
+                    text_region.confidence = _sentence_confidence(character_confidences)
+                    text_region.metadata = {"confidence_type": "geometric_mean_generated_token_probability"}
+                logger.info(
+                    "Baberu OCR result: %s (confidence: %s, character confidences: %s)",
+                    text,
+                    f"{text_region.confidence:.4f}" if text_region.confidence is not None else "unavailable",
+                    character_confidences if character_confidences is not None else "unavailable",
+                )
+                regions.append(text_region)
         return regions
 
     def _get_engine(self) -> None:
