@@ -15,6 +15,7 @@ from src.translator import OllamaCorrector, OllamaTranslator
 from src.viewer import ImageViewer
 
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+DETAIL_LOGGERS = ("src.ocr.mangaocr", "src.ocr.baberuocr", "src.translator.ollama")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -37,6 +38,7 @@ def build_inpainter(settings: Settings):
             settings.white_background_ratio,
             settings.inpaint_radius,
             settings.mask_dilation,
+            settings.ocr_clear_padding,
             settings.bubble_padding,
             settings.bubble_close_kernel,
             settings.bubble_clear_mode,
@@ -105,9 +107,16 @@ def image_paths(arguments: argparse.Namespace) -> list[Path]:
     return sorted((path for path in arguments.dir.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES), key=lambda path: path.name.lower())
 
 
+def configure_logging(debug: bool) -> None:
+    level = logging.INFO if debug else logging.WARNING
+    for logger_name in DETAIL_LOGGERS:
+        logging.getLogger(logger_name).setLevel(level)
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     arguments = parse_arguments()
+    configure_logging(arguments.debug)
     project_root = Path(__file__).resolve().parent
     try:
         paths = image_paths(arguments)

@@ -82,7 +82,7 @@ All runtime settings are in `.env`:
 - `OCR_MIN_TRANSLATION_CONFIDENCE`: Minimum reliable sentence-level OCR confidence for translation, from `0` to `1`; defaults to `0.50`. Applies only when the OCR backend provides confidence.
 - `PIPELINE_MODE`: `two-stage` uses text detection; `one-stage` uses bubble segmentation; `hybrid` combines both.
 - `YOLO_MODEL_PATH`, `YOLO_CONFIDENCE`, `BUBBLE_MODEL_PATH`, `BUBBLE_CONFIDENCE`: Detection and bubble-segmentation model settings.
-- `INPAINT_ENABLED`, `INPAINT_ENGINE`, and the remaining `BUBBLE_`, `TEXT_DARK_`, `WHITE_BACKGROUND_`, `INPAINT_`, and `MASK_` settings: Source-text removal behavior.
+- `INPAINT_ENABLED`, `INPAINT_ENGINE`, and the remaining `BUBBLE_`, `TEXT_DARK_`, `WHITE_BACKGROUND_`, `INPAINT_`, `MASK_`, and `OCR_CLEAR_PADDING` settings: Source-text removal behavior. `OCR_CLEAR_PADDING` expands the detection area used for clearing while the bubble mask still limits the cleared pixels.
 
 ### OCR Support
 

@@ -15,6 +15,7 @@ from src.models import OCRResult
 from .baberu.configuration_baberu import BaberuOCRConfig
 from .baberu.modeling_baberu import BaberuOCRModel
 from .baberu.tokenization_baberu import BaberuTokenizer
+from .region_splitter import crop_for_ocr, split_text_regions
 
 logger = logging.getLogger(__name__)
 
@@ -58,21 +59,22 @@ class BaberuOCR:
         regions: list[OCRResult] = []
         for candidate in self._detector.detect(image):
             region = candidate if isinstance(candidate, OCRResult) else OCRResult(bbox=candidate, source_text="")
-            text, character_confidences = self._recognize(image.crop(region.source_bbox or region.bbox))
-            text, character_confidences = _strip_text_and_confidences(text, character_confidences)
-            if text:
-                region.source_text = text
-                region.character_confidences = character_confidences
-                if character_confidences is not None:
-                    region.confidence = _sentence_confidence(character_confidences)
-                    region.metadata = {"confidence_type": "geometric_mean_generated_token_probability"}
-                logger.info(
-                    "Baberu OCR result: %s (confidence: %s, character confidences: %s)",
-                    text,
-                    f"{region.confidence:.4f}" if region.confidence is not None else "unavailable",
-                    character_confidences if character_confidences is not None else "unavailable",
-                )
-                regions.append(region)
+            for text_region in split_text_regions(image, region):
+                text, character_confidences = self._recognize(crop_for_ocr(image, text_region))
+                text, character_confidences = _strip_text_and_confidences(text, character_confidences)
+                if text:
+                    text_region.source_text = text
+                    text_region.character_confidences = character_confidences
+                    if character_confidences is not None:
+                        text_region.confidence = _sentence_confidence(character_confidences)
+                        text_region.metadata = {"confidence_type": "geometric_mean_generated_token_probability"}
+                    logger.info(
+                        "Baberu OCR result: %s (confidence: %s, character confidences: %s)",
+                        text,
+                        f"{text_region.confidence:.4f}" if text_region.confidence is not None else "unavailable",
+                        character_confidences if character_confidences is not None else "unavailable",
+                    )
+                    regions.append(text_region)
         return regions
 
     def _get_engine(self) -> None:

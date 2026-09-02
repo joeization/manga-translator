@@ -9,6 +9,8 @@ from PIL import Image
 
 from src.models import OCRResult
 
+from .region_splitter import crop_for_ocr, split_text_regions
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,11 +27,12 @@ class MangaOCR:
         regions: list[OCRResult] = []
         for candidate in self._detector.detect(image):
             region = candidate if isinstance(candidate, OCRResult) else OCRResult(bbox=candidate, source_text="")
-            text = engine(image.crop(region.source_bbox or region.bbox)).strip()
-            if text:
-                region.source_text = text
-                logger.info("MangaOCR result: %s (confidence: unavailable)", text)
-                regions.append(region)
+            for text_region in split_text_regions(image, region):
+                text = engine(crop_for_ocr(image, text_region)).strip()
+                if text:
+                    text_region.source_text = text
+                    logger.info("MangaOCR result: %s (confidence: unavailable)", text)
+                    regions.append(text_region)
         return regions
 
     def _get_engine(self):

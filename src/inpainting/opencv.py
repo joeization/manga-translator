@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import cv2
 import numpy as np
 from PIL import Image
@@ -18,6 +20,7 @@ class OpenCVInpainter(Inpainter):
         white_ratio: float,
         inpaint_radius: int,
         mask_dilation: int,
+        ocr_clear_padding: int,
         bubble_padding: int,
         bubble_close_kernel: int,
         bubble_clear_mode: str,
@@ -29,6 +32,7 @@ class OpenCVInpainter(Inpainter):
         self._white_ratio = white_ratio
         self._inpaint_radius = inpaint_radius
         self._mask_dilation = mask_dilation
+        self._ocr_clear_padding = ocr_clear_padding
         self._bubble_padding = bubble_padding
         self._bubble_close_kernel = bubble_close_kernel
         self._bubble_clear_mode = bubble_clear_mode
@@ -43,7 +47,8 @@ class OpenCVInpainter(Inpainter):
         return Image.fromarray(pixels, mode="RGB")
 
     def _inpaint_region(self, pixels: np.ndarray, region: TextRegion) -> None:
-        left, top, right, bottom = region.bbox
+        expanded_region = replace(region, bbox=_expand_bbox(region.bbox, pixels.shape[1], pixels.shape[0], self._ocr_clear_padding))
+        left, top, right, bottom = expanded_region.bbox
         roi = pixels[top:bottom, left:right]
         if roi.size == 0:
             return
@@ -58,12 +63,12 @@ class OpenCVInpainter(Inpainter):
         if not np.any(text_mask):
             return
 
-        bubble = _existing_bubble(region) or self._bubble_segmenter.segment(Image.fromarray(pixels), region) or self._find_bubble(pixels, region)
+        bubble = _existing_bubble(expanded_region) or self._bubble_segmenter.segment(Image.fromarray(pixels), expanded_region) or self._find_bubble(pixels, expanded_region)
         if bubble is not None:
             bubble_bbox, bubble_mask = bubble
-            region.layout_bbox = bubble_bbox
-            region.layout_mask = bubble_mask
-            bubble_interior = _bubble_mask_in_region(region.bbox, bubble_bbox, bubble_mask)
+            expanded_region.layout_bbox = bubble_bbox
+            expanded_region.layout_mask = bubble_mask
+            bubble_interior = _bubble_mask_in_region(expanded_region.bbox, bubble_bbox, bubble_mask)
             if self._bubble_clear_mode == "interior" and np.any(bubble_interior):
                 roi[_inset_bubble_mask(bubble_interior, self._bubble_border_width)] = 255
                 return
@@ -152,6 +157,16 @@ def _inset_bubble_mask(mask: np.ndarray, border_width: int) -> np.ndarray:
         borderType=cv2.BORDER_CONSTANT,
         borderValue=0,
     ).astype(bool)
+
+
+def _expand_bbox(bbox: tuple[int, int, int, int], image_width: int, image_height: int, padding: int) -> tuple[int, int, int, int]:
+    left, top, right, bottom = bbox
+    return (
+        max(0, left - padding),
+        max(0, top - padding),
+        min(image_width, right + padding),
+        min(image_height, bottom + padding),
+    )
 
 
 def _bubble_mask_in_region(
