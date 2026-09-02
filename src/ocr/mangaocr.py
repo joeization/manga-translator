@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -7,6 +8,8 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 
 from src.models import OCRResult
+
+logger = logging.getLogger(__name__)
 
 
 class MangaOCR:
@@ -25,6 +28,7 @@ class MangaOCR:
             text = engine(image.crop(region.source_bbox or region.bbox)).strip()
             if text:
                 region.source_text = text
+                logger.info("MangaOCR result: %s (confidence: unavailable)", text)
                 regions.append(region)
         return regions
 

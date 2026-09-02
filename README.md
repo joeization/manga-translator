@@ -77,16 +77,25 @@ All runtime settings are in `.env`:
 - `OUTPUT_DIR`, `OUTPUT_FORMAT`, `OUTPUT_JPEG_QUALITY`: Output location and JPEG quality.
 - `FONT_PATH`, `FONT_SIZE`, `MAX_FONT_SIZE`, `MIN_FONT_SIZE`, `TEXT_PADDING`: Render font and sizing.
 - `RENDERER_ENGINE`, `TEXT_DIRECTION`, `TEXT_ANCHOR_ENGINE`, `TEXT_ANCHOR_BORDER_MARGIN`: Text rendering and placement behavior.
-- `OCR_ENGINE`: `manga-ocr` (default) or `baberu`.
+- `OCR_ENGINE`: `manga-ocr` (default) or `baberu`; selects the text recognizer used for each detected region.
 - `OCR_MODEL_DIR`: Root directory for local OCR models. Baberu loads `baberu-ocr` beneath it.
+- `OCR_MIN_TRANSLATION_CONFIDENCE`: Minimum reliable sentence-level OCR confidence for translation, from `0` to `1`; defaults to `0.50`. Applies only when the OCR backend provides confidence.
 - `PIPELINE_MODE`: `two-stage` uses text detection; `one-stage` uses bubble segmentation; `hybrid` combines both.
 - `YOLO_MODEL_PATH`, `YOLO_CONFIDENCE`, `BUBBLE_MODEL_PATH`, `BUBBLE_CONFIDENCE`: Detection and bubble-segmentation model settings.
 - `INPAINT_ENABLED`, `INPAINT_ENGINE`, and the remaining `BUBBLE_`, `TEXT_DARK_`, `WHITE_BACKGROUND_`, `INPAINT_`, and `MASK_` settings: Source-text removal behavior.
 
 ### OCR Support
 
-`manga-ocr` is specialized for Japanese manga. Set `OCR_ENGINE=baberu` to use the included Baberu OCR checkpoint, which recognizes Japanese, Chinese, and English manga text. Both engines recognize each post-processed text region and implement the same pipeline OCR interface.
+OCR has two stages: bubble/text-region detection followed by text recognition.
+
+- `PIPELINE_MODE=two-stage` detects text with the Manga109 YOLO detector.
+- `PIPELINE_MODE=one-stage` detects bubbles with the Manga109 bubble-segmentation model.
+- `PIPELINE_MODE=hybrid` combines the YOLO text detector with bubble segmentation and post-processes their overlaps.
+- `OCR_ENGINE=manga-ocr` recognizes Japanese manga text in each detected region.
+- `OCR_ENGINE=baberu` uses the included Baberu checkpoint to recognize Japanese, Chinese, and English manga text in each detected region.
+
+Both recognizers implement the same pipeline OCR interface.
 
 ## Translation Rules
 
-Edit [prompts/translation.txt](prompts/translation.txt) to adjust translation style. The `{{source_language}}` and `{{target_language}}` placeholders are replaced from `.env`. Keep the JSON-only output and response-format rules, or the program will be unable to parse translations.
+Edit [prompts/translation.txt](prompts/translation.txt) and [prompts/correction.txt](prompts/correction.txt) to adjust translation and OCR-correction behavior. The `{{source_language}}` and `{{target_language}}` placeholders are replaced from `.env`; each OCR entry is processed in its own Ollama request with the complete page text supplied as context.

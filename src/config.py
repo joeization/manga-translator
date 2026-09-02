@@ -30,6 +30,7 @@ class Settings:
     text_anchor_border_margin: int
     ocr_engine: str
     ocr_model_dir: Path
+    ocr_min_translation_confidence: float
     pipeline_mode: str
     yolo_model_path: Path
     yolo_confidence: float
@@ -73,6 +74,7 @@ class Settings:
             text_anchor_border_margin=int(_required_setting("TEXT_ANCHOR_BORDER_MARGIN")),
             ocr_engine=os.getenv("OCR_ENGINE", "manga-ocr").lower(),
             ocr_model_dir=_project_path(project_root, _required_setting("OCR_MODEL_DIR")),
+            ocr_min_translation_confidence=_confidence_setting("OCR_MIN_TRANSLATION_CONFIDENCE", 0.5),
             pipeline_mode=_required_setting("PIPELINE_MODE").lower(),
             yolo_model_path=_project_path(project_root, _required_setting("YOLO_MODEL_PATH")),
             yolo_confidence=float(_required_setting("YOLO_CONFIDENCE")),
@@ -103,3 +105,10 @@ def _required_setting(name: str) -> str:
 def _project_path(project_root: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else project_root / path
+
+
+def _confidence_setting(name: str, default: float) -> float:
+    value = float(os.getenv(name, str(default)))
+    if not 0 <= value <= 1:
+        raise RuntimeError(f"{name} must be between 0 and 1.")
+    return value

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import math
 import unicodedata
 from pathlib import Path
 
@@ -13,6 +15,8 @@ from src.models import OCRResult
 from .baberu.configuration_baberu import BaberuOCRConfig
 from .baberu.modeling_baberu import BaberuOCRModel
 from .baberu.tokenization_baberu import BaberuTokenizer
+
+logger = logging.getLogger(__name__)
 
 
 class CapContentRun(LogitsProcessor):
@@ -54,9 +58,20 @@ class BaberuOCR:
         regions: list[OCRResult] = []
         for candidate in self._detector.detect(image):
             region = candidate if isinstance(candidate, OCRResult) else OCRResult(bbox=candidate, source_text="")
-            text = self._recognize(image.crop(region.source_bbox or region.bbox)).strip()
+            text, character_confidences = self._recognize(image.crop(region.source_bbox or region.bbox))
+            text, character_confidences = _strip_text_and_confidences(text, character_confidences)
             if text:
                 region.source_text = text
+                region.character_confidences = character_confidences
+                if character_confidences is not None:
+                    region.confidence = _sentence_confidence(character_confidences)
+                    region.metadata = {"confidence_type": "geometric_mean_generated_token_probability"}
+                logger.info(
+                    "Baberu OCR result: %s (confidence: %s, character confidences: %s)",
+                    text,
+                    f"{region.confidence:.4f}" if region.confidence is not None else "unavailable",
+                    character_confidences if character_confidences is not None else "unavailable",
+                )
                 regions.append(region)
         return regions
 
@@ -104,14 +119,14 @@ class BaberuOCR:
         }
 
     @torch.inference_mode()
-    def _recognize(self, image: Image.Image) -> str:
+    def _recognize(self, image: Image.Image) -> tuple[str, list[float] | None]:
         assert self._model is not None
         assert self._tokenizer is not None
         assert self._image_processor is not None
         assert self._device is not None
         pixel_values = self._image_processor(image.convert("RGB"), return_tensors="pt")["pixel_values"].to(self._device)
         input_ids = torch.tensor([[self._tokenizer.bos_token_id]], device=self._device)
-        output_ids = self._model.generate(
+        output = self._model.generate(
             input_ids=input_ids,
             pixel_values=pixel_values,
             max_new_tokens=128,
@@ -122,9 +137,52 @@ class BaberuOCR:
             pad_token_id=self._tokenizer.pad_token_id,
             bos_token_id=self._tokenizer.bos_token_id,
             use_cache=True,
+            return_dict_in_generate=True,
+            output_scores=True,
         )
-        return self._tokenizer.decode(output_ids[0, input_ids.shape[1]:].cpu().tolist(), skip_special_tokens=True)
+        return _decode_with_character_confidences(
+            output.sequences[0, input_ids.shape[1]:].cpu().tolist(),
+            output.scores,
+            self._tokenizer,
+            self._tokenizer.eos_token_id,
+        )
 
 
 def _is_content_character(character: str) -> bool:
     return len(character) == 1 and character not in "ーｰ〜~" and unicodedata.category(character)[0] in "LN"
+
+
+def _decode_with_character_confidences(
+    token_ids: list[int], scores: tuple[torch.Tensor, ...], tokenizer: BaberuTokenizer, eos_token_id: int
+) -> tuple[str, list[float] | None]:
+    if len(token_ids) != len(scores):
+        return tokenizer.decode(token_ids, skip_special_tokens=True), None
+
+    characters: list[str] = []
+    character_confidences: list[float] = []
+    for index, (token_id, logits) in enumerate(zip(token_ids, scores, strict=True)):
+        if token_id == eos_token_id and index == len(token_ids) - 1:
+            continue
+        character = tokenizer.decode([token_id], skip_special_tokens=False)
+        if len(character) != 1:
+            return tokenizer.decode(token_ids, skip_special_tokens=True), None
+        probability = torch.softmax(logits[0].float(), dim=-1)[token_id].item()
+        characters.append(character)
+        character_confidences.append(float(probability))
+    return "".join(characters), character_confidences
+
+
+def _strip_text_and_confidences(text: str, character_confidences: list[float] | None) -> tuple[str, list[float] | None]:
+    left_trim = len(text) - len(text.lstrip())
+    right_trim = len(text) - len(text.rstrip())
+    stripped_text = text.strip()
+    if character_confidences is None or len(character_confidences) != len(text):
+        return stripped_text, None
+    end = len(character_confidences) - right_trim if right_trim else len(character_confidences)
+    return stripped_text, character_confidences[left_trim:end]
+
+
+def _sentence_confidence(character_confidences: list[float]) -> float:
+    if not character_confidences or any(confidence <= 0 for confidence in character_confidences):
+        return 0.0
+    return math.exp(sum(math.log(confidence) for confidence in character_confidences) / len(character_confidences))

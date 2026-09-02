@@ -117,6 +117,7 @@ def main() -> int:
         corrector = OllamaCorrector(
             settings.ollama_host,
             settings.ollama_model,
+            settings.source_language,
             settings.correction_prompt_path,
         )
         translator = OllamaTranslator(
@@ -133,6 +134,7 @@ def main() -> int:
             build_inpainter(settings),
             build_renderer(settings),
             build_anchor_detector(settings),
+            settings.ocr_min_translation_confidence,
         )
         images: Queue = Queue()
         failures = [0]

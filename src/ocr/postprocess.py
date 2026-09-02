@@ -14,7 +14,7 @@ class BubblePostprocessConfig:
     source_match_iou: float = 0.1
     long_strip_aspect_ratio: float = 3.0
     long_strip_cross_axis_overlap: float = 0.9
-    long_strip_gap_ratio: float = 0.12
+    long_strip_gap_ratio: float = 0.0
 
 
 DEFAULT_CONFIG = BubblePostprocessConfig()
@@ -37,7 +37,7 @@ def postprocess_bubbles(
             continue
         segmentation_index = matches_by_yolo[yolo_index]
         if segmentation_index is None:
-            results.append(TextRegion(bbox=yolo.bbox, source_text="", confidence=yolo.confidence))
+            results.append(TextRegion(bbox=yolo.bbox, source_text="", detection_confidence=yolo.detection_confidence))
             continue
         yolo_indices = _long_strip_component(yolo_index, yolo_bubbles, matches_by_yolo, config)
         visited_yolo.update(yolo_indices)
@@ -46,9 +46,9 @@ def postprocess_bubbles(
         yolo = _merge_bboxes([yolo_bubbles[index] for index in yolo_indices])
         results.append(
             TextRegion(
-                bbox=segmentation.bbox,
+                bbox=yolo.bbox,
                 source_text="",
-                confidence=max(yolo.confidence, segmentation.confidence),
+                detection_confidence=max(yolo.detection_confidence, segmentation.detection_confidence),
                 source_bbox=yolo.bbox,
                 layout_bbox=segmentation.layout_bbox,
                 layout_mask=segmentation.layout_mask,
@@ -89,7 +89,7 @@ def _long_strip_component(
 
 def _non_maximum_suppression(candidates: list[TextRegion], threshold: float) -> list[TextRegion]:
     kept: list[TextRegion] = []
-    for candidate in sorted(candidates, key=lambda region: region.confidence, reverse=True):
+    for candidate in sorted(candidates, key=lambda region: region.detection_confidence, reverse=True):
         if all(_bbox_iou(candidate.bbox, existing.bbox) < threshold for existing in kept):
             kept.append(candidate)
     return kept
@@ -152,7 +152,7 @@ def _merge_bboxes(candidates: list[TextRegion]) -> TextRegion:
     top = min(candidate.bbox[1] for candidate in candidates)
     right = max(candidate.bbox[2] for candidate in candidates)
     bottom = max(candidate.bbox[3] for candidate in candidates)
-    return TextRegion(bbox=(left, top, right, bottom), source_text="", confidence=max(candidate.confidence for candidate in candidates))
+    return TextRegion(bbox=(left, top, right, bottom), source_text="", detection_confidence=max(candidate.detection_confidence for candidate in candidates))
 
 
 def _merge_masks(candidates: list[TextRegion]) -> TextRegion:
@@ -167,7 +167,7 @@ def _merge_masks(candidates: list[TextRegion]) -> TextRegion:
         candidate_left, candidate_top, candidate_right, candidate_bottom = candidate.layout_bbox
         mask[candidate_top - top : candidate_bottom - top, candidate_left - left : candidate_right - left] |= candidate.layout_mask
     bbox = (left, top, right, bottom)
-    return TextRegion(bbox=bbox, source_text="", confidence=max(candidate.confidence for candidate in candidates), layout_bbox=bbox, layout_mask=mask)
+    return TextRegion(bbox=bbox, source_text="", detection_confidence=max(candidate.detection_confidence for candidate in candidates), layout_bbox=bbox, layout_mask=mask)
 
 
 def _mask_iou(first: TextRegion, second: TextRegion) -> float:

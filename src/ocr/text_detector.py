@@ -38,7 +38,7 @@ class Manga109YoloTextDetector:
                 continue
             bbox = _clip_bbox(coordinates, image.size)
             if bbox is not None:
-                regions.append(TextRegion(bbox=bbox, source_text="", confidence=float(confidence)))
+                regions.append(TextRegion(bbox=bbox, source_text="", detection_confidence=float(confidence)))
         return postprocess_bubbles(regions, [])
 
     def _get_model(self) -> YOLO:
@@ -82,7 +82,7 @@ class Manga109BubbleSegmenter:
             local_polygon = np.round(polygon - np.array([left, top])).astype(np.int32)
             mask = np.zeros((bottom - top, right - left), dtype=np.uint8)
             cv2.fillPoly(mask, [local_polygon], 1)
-            regions.append(TextRegion(bbox=bbox, source_text="", confidence=float(confidence), layout_bbox=bbox, layout_mask=mask.astype(bool)))
+            regions.append(TextRegion(bbox=bbox, source_text="", detection_confidence=float(confidence), layout_bbox=bbox, layout_mask=mask.astype(bool)))
         return postprocess_bubbles([], regions)
 
     def _get_model(self) -> YOLO:

@@ -1,26 +1,21 @@
-Translate the following {{source_language}} manga dialogue into natural {{target_language}}.
+Translate the following text from {{source_language}} to natural {{target_language}}.
+
+Your task is ONLY to translate the current text.
 
 Rules:
 
-1. Output exactly one line for each input line, in the same order.
-2. Output only the translations. Do not add explanations, comments, labels, brackets, or parentheses.
-3. Preserve the complete meaning of the original. Do not omit, generalize, weaken, euphemize, or replace specific actions, objects, body parts, or expressions.
-4. Translate vulgar, crude, sexual, violent, or otherwise strong wording according to its actual meaning and intensity.
-5. Do not turn specific actions into vague descriptions.
-6. Manga sound effects are part of the original text. Translate them as manga sound effects or concise descriptions appropriate for Traditional Chinese manga. Never explain what a sound effect means.
-7. Do not add information that is not present in the source.
-8. Preserve character voice, tone, emotion, politeness, and speech style.
-9. Keep names and terminology consistent.
-10. Preserve obviously intentional unusual wording.
-11. The input may contain OCR errors. Correct an OCR error only when the intended Japanese is strongly supported by the surrounding context.
-12. Do not translate or explain non-Japanese text.
+1. Output ONLY the translation.
+2. Preserve the complete meaning, tone, personality, and strength of the original.
+3. Do not omit, summarize, weaken, euphemize, censor, explain, or add information.
+4. Preserve specific actions, objects, people, relationships, names, terminology, slang, vulgarity, and unusual expressions.
+5. Use the context to resolve obvious OCR errors or ambiguous wording, but do not guess when the meaning is uncertain.
+6. Preserve repetitions, incomplete sentences, interjections, and sound effects naturally.
+7. For sound effects and onomatopoeia, translate only when the meaning is clear. If uncertain or unusual, preserve only that fragment rather than guessing.
+8. Never explain or annotate sound effects with parentheses or descriptions.
+9. Expand or interpret casual abbreviations, clipped greetings, and elongated spellings using the context before translating.
+10. Do not rewrite the text merely to make it more polished.
+11. When {{source_language}} and {{target_language}} differ, do not return the entire current input unchanged merely because it contains an unfamiliar, unusual, or untranslatable fragment. Translate every part whose meaning can be determined from the input or context.
+12. Output exactly one translation for the current input.
 
-Input:
-<{{source_language}} text of entry 0>
-<{{source_language}} text of entry 1>
-...
-
-Output:
-<{{target_language}} translation of entry 0>
-<{{target_language}} translation of entry 1>
-...
+Page context (reference only; do not translate or output it):
+{{context}}
