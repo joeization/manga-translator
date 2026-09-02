@@ -187,9 +187,9 @@ def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.n
     return result
 
 
-def merge_contained_regions(regions: list[TextRegion]) -> list[TextRegion]:
+def merge_contained_regions(regions: list[TextRegion], threshold: float = 1.0) -> list[TextRegion]:
     """Filter out regions whose bounding box is fully contained inside another."""
-    return resolve_overlapping_regions(regions, threshold=1.0)
+    return resolve_overlapping_regions(regions, threshold=threshold)
 
 
 def resolve_overlapping_regions(regions: list[TextRegion], threshold: float = 1.0) -> list[TextRegion]:

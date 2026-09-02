@@ -6,6 +6,8 @@ from pathlib import Path
 from queue import Queue
 from threading import Event, Thread
 
+from PIL import Image
+
 from src.config import Settings
 from src.inpainting import NoopInpainter, OpenCVInpainter
 from src.ocr import BaberuOCR, HybridTextBubbleDetector, MangaOCR, Manga109BubbleSegmenter, Manga109YoloTextDetector
@@ -46,6 +48,7 @@ def build_inpainter(settings: Settings):
             settings.bubble_border_width,
             settings.text_bright_threshold,
             settings.solid_fill_std_threshold,
+            settings.inpaint_algorithm,
         )
     if settings.inpaint_engine == "lama":
         from src.inpainting import LamaInpainter
@@ -121,6 +124,27 @@ def configure_logging(debug: bool) -> None:
         logging.getLogger(logger_name).setLevel(level)
 
 
+def build_side_by_side_image(original: Image.Image, translated: Image.Image) -> Image.Image:
+    """Combine original image (left) and translated image (right) side by side."""
+    orig_rgb = original.convert("RGB")
+    trans_rgb = translated.convert("RGB")
+    if orig_rgb.height != trans_rgb.height:
+        target_h = max(orig_rgb.height, trans_rgb.height)
+        if orig_rgb.height != target_h:
+            w = max(1, round(orig_rgb.width * target_h / orig_rgb.height))
+            orig_rgb = orig_rgb.resize((w, target_h), Image.Resampling.LANCZOS)
+        if trans_rgb.height != target_h:
+            w = max(1, round(trans_rgb.width * target_h / trans_rgb.height))
+            trans_rgb = trans_rgb.resize((w, target_h), Image.Resampling.LANCZOS)
+
+    combined_width = orig_rgb.width + trans_rgb.width
+    combined_height = max(orig_rgb.height, trans_rgb.height)
+    combined = Image.new("RGB", (combined_width, combined_height), (255, 255, 255))
+    combined.paste(orig_rgb, (0, 0))
+    combined.paste(trans_rgb, (orig_rgb.width, 0))
+    return combined
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     arguments = parse_arguments()
@@ -163,19 +187,22 @@ def main() -> int:
                     break
                 logging.info("[%d/%d] %s", number, len(paths), image_path.name)
                 try:
-                    image, regions = pipeline.process_file(image_path, cancel_event)
+                    with Image.open(image_path) as source:
+                        original_image = source.convert("RGB")
+                    translated_image, regions = pipeline.process(original_image.copy(), cancel_event)
                     for index, region in enumerate(regions, start=1):
                         logging.info("  [%d] %s -> %s", index, region.source_text, region.translated_text)
                     if arguments.show:
-                        images.put(draw_debug_image(image, regions) if arguments.debug else image)
+                        right_image = draw_debug_image(translated_image, regions) if arguments.debug else translated_image
+                        images.put(build_side_by_side_image(original_image, right_image))
                     else:
                         output_path = settings.output_dir / f"{image_path.stem}_translated.{settings.output_format}"
                         output_path.parent.mkdir(parents=True, exist_ok=True)
-                        save_output(image, output_path, settings)
+                        save_output(translated_image, output_path, settings)
                         logging.info("  Saved: %s", output_path)
                         if arguments.debug:
                             debug_path = settings.output_dir / f"{image_path.stem}_translated_debug.{settings.output_format}"
-                            save_debug_image(image, regions, debug_path)
+                            save_debug_image(translated_image, regions, debug_path)
                             logging.info("  Saved debug image: %s", debug_path)
                 except PipelineError as error:
                     failures[0] += 1

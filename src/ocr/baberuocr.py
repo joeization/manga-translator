@@ -134,6 +134,7 @@ class BaberuOCR:
             size={"height": 224, "width": 224},
             crop_size=None,
             local_files_only=True,
+            use_fast=True,
         )
         self._device = device
         self._content_ids = {

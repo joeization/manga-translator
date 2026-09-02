@@ -10,3 +10,5 @@ manga-ocr
 ultralytics
 huggingface_hub
 safetensors
+onnxscript
+onnxruntime-gpu

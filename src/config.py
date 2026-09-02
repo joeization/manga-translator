@@ -51,12 +51,14 @@ class Settings:
     bubble_border_width: int
     text_bright_threshold: int
     solid_fill_std_threshold: float
+    inpaint_algorithm: str
     lama_model_path: Path | None
     lama_device: str
 
     @classmethod
     def load(cls, project_root: Path) -> "Settings":
         load_dotenv(project_root / ".env")
+        os.environ["TORCH_HOME"] = str(project_root / "models")
         return cls(
             project_root=project_root,
             ollama_host=_required_setting("OLLAMA_HOST"),
@@ -77,7 +79,7 @@ class Settings:
             text_direction=_required_setting("TEXT_DIRECTION").lower(),
             text_anchor_engine=_required_setting("TEXT_ANCHOR_ENGINE").lower(),
             text_anchor_border_margin=int(_required_setting("TEXT_ANCHOR_BORDER_MARGIN")),
-            ocr_engine=os.getenv("OCR_ENGINE", "manga-ocr").lower(),
+            ocr_engine=_optional_setting("OCR_ENGINE", "manga-ocr").lower(),
             ocr_model_dir=_project_path(project_root, _required_setting("OCR_MODEL_DIR")),
             ocr_min_translation_confidence=_confidence_setting("OCR_MIN_TRANSLATION_CONFIDENCE", 0.5),
             pipeline_mode=_required_setting("PIPELINE_MODE").lower(),
@@ -86,22 +88,23 @@ class Settings:
             bubble_model_path=_project_path(project_root, _required_setting("BUBBLE_MODEL_PATH")),
             bubble_confidence=float(_required_setting("BUBBLE_CONFIDENCE")),
             inpaint_enabled=_required_setting("INPAINT_ENABLED").lower() == "true",
-            inpaint_engine=_required_setting("INPAINT_ENGINE"),
+            inpaint_engine=_required_setting("INPAINT_ENGINE").lower(),
             text_dark_threshold=int(_required_setting("TEXT_DARK_THRESHOLD")),
             white_background_threshold=int(_required_setting("WHITE_BACKGROUND_THRESHOLD")),
             white_background_ratio=float(_required_setting("WHITE_BACKGROUND_RATIO")),
             inpaint_radius=int(_required_setting("INPAINT_RADIUS")),
             mask_dilation=int(_required_setting("MASK_DILATION")),
-            ocr_clear_padding=int(os.getenv("OCR_CLEAR_PADDING", "12")),
+            ocr_clear_padding=int(_required_setting("OCR_CLEAR_PADDING")),
             bubble_padding=int(_required_setting("BUBBLE_PADDING")),
             bubble_close_kernel=int(_required_setting("BUBBLE_CLOSE_KERNEL")),
             bubble_clear_mode=_required_setting("BUBBLE_CLEAR_MODE").lower(),
             bubble_min_overlap=float(_required_setting("BUBBLE_MIN_OVERLAP")),
             bubble_border_width=int(_required_setting("BUBBLE_BORDER_WIDTH")),
-            text_bright_threshold=int(os.getenv("TEXT_BRIGHT_THRESHOLD", "220")),
-            solid_fill_std_threshold=float(os.getenv("SOLID_FILL_STD_THRESHOLD", "30")),
-            lama_model_path=_project_path(project_root, os.getenv("LAMA_MODEL_PATH")) if os.getenv("LAMA_MODEL_PATH") else None,
-            lama_device=os.getenv("LAMA_DEVICE", "cpu"),
+            text_bright_threshold=int(_optional_setting("TEXT_BRIGHT_THRESHOLD", "220")),
+            solid_fill_std_threshold=float(_optional_setting("SOLID_FILL_STD_THRESHOLD", "5")),
+            inpaint_algorithm=_optional_setting("INPAINT_ALGORITHM", "telea").lower(),
+            lama_model_path=_project_path(project_root, _optional_setting("LAMA_MODEL_PATH", "models/inpainting_lama/lama-manga.onnx")),
+            lama_device=_optional_setting("LAMA_DEVICE", "gpu").lower(),
         )
 
 
@@ -112,13 +115,19 @@ def _required_setting(name: str) -> str:
     return value
 
 
+def _optional_setting(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return value if value is not None and value != "" else default
+
+
 def _project_path(project_root: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else project_root / path
 
 
 def _confidence_setting(name: str, default: float) -> float:
-    value = float(os.getenv(name, str(default)))
+    val_str = _optional_setting(name, str(default))
+    value = float(val_str)
     if not 0 <= value <= 1:
         raise RuntimeError(f"{name} must be between 0 and 1.")
     return value

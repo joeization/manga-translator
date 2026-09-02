@@ -1,3 +1,8 @@
+"""
+Pillow-based renderer for placing translated text onto images.
+Supports horizontal and vertical-rtl text directions, mask-aware bubble layout,
+and automatic white/dark stroke outline rendering.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,7 +14,6 @@ from PIL import Image, ImageDraw, ImageFont
 from src.models import TextRegion
 
 from .base import Renderer
-
 
 VERTICAL_PUNCTUATION_MAP = {
     "\u300c": "\ufe41",  # 「 -> ﹁
@@ -39,18 +43,25 @@ VERTICAL_PUNCTUATION_MAP = {
 }
 
 
-_VERTICAL_TRANS_TABLE = str.maketrans(VERTICAL_PUNCTUATION_MAP)
-
-
 def to_vertical_text(text: str) -> str:
     """Convert horizontal punctuation and brackets to vertical orientation symbols."""
-    return text.translate(_VERTICAL_TRANS_TABLE) if text else ""
+    return "".join(VERTICAL_PUNCTUATION_MAP.get(char, char) for char in text)
 
 
 class PillowRenderer(Renderer):
-    def __init__(self, font_path: Path, font_size: int, max_font_size: int, min_font_size: int, padding: int, text_direction: str) -> None:
-        self._font_path = font_path
-        self._font_size = min(font_size, max_font_size)
+    """Pillow renderer with text wrapping and outline stroke support."""
+
+    def __init__(
+        self,
+        font_path: Path | str,
+        font_size: int = 56,
+        max_font_size: int = 72,
+        min_font_size: int = 12,
+        padding: int = 4,
+        text_direction: str = "vertical-rtl",
+    ) -> None:
+        self._font_path = Path(font_path)
+        self._font_size = font_size
         self._max_font_size = max_font_size
         self._min_font_size = min_font_size
         self._padding = padding
@@ -58,13 +69,22 @@ class PillowRenderer(Renderer):
         self._fonts: dict[int, ImageFont.FreeTypeFont] = {}
 
     def render(self, image: Image.Image, regions: list[TextRegion]) -> Image.Image:
-        if not self._font_path.is_file():
-            raise RuntimeError(f"CJK font not found: {self._font_path}")
+        image = image.copy()
         draw = ImageDraw.Draw(image)
         for region in regions:
             if region.translated_text:
                 self._render_region(draw, region)
         return image
+
+    def _text_color(self, region: TextRegion) -> tuple[int, int, int]:
+        """Return fill colour to use for region's translated text.
+
+        Reads ``ink_color`` from ``region.metadata``. Defaults to black (0,0,0).
+        """
+        ink = (region.metadata or {}).get("ink_color")
+        if isinstance(ink, (tuple, list)) and len(ink) == 3:
+            return (int(ink[0]), int(ink[1]), int(ink[2]))
+        return (0, 0, 0)
 
     def _render_region(self, draw: ImageDraw.ImageDraw, region: TextRegion) -> None:
         if self._text_direction == "vertical-rtl":
@@ -74,6 +94,7 @@ class PillowRenderer(Renderer):
         available_width = max(1, right - left - self._padding * 2)
         available_height = max(1, bottom - top - self._padding * 2)
 
+        fill = self._text_color(region)
         for size in self._font_sizes(available_height):
             font = self._font(size)
             text = _wrap_text(draw, region.translated_text or "", font, available_width)
@@ -82,7 +103,8 @@ class PillowRenderer(Renderer):
             if text_width <= available_width and text_height <= available_height:
                 x = left + (right - left - text_width) / 2 - bounds[0]
                 y = top + (bottom - top - text_height) / 2 - bounds[1]
-                draw.multiline_text((x, y), text, font=font, fill="black", spacing=0, align="center")
+                sw, sf = _stroke_info(fill, font.size)
+                draw.multiline_text((x, y), text, font=font, fill=fill, spacing=0, align="center", stroke_width=sw, stroke_fill=sf)
                 return
 
     def _render_vertical_region(self, draw: ImageDraw.ImageDraw, region: TextRegion) -> None:
@@ -99,15 +121,23 @@ class PillowRenderer(Renderer):
         )
         if size is not None:
             columns = _vertical_columns_for_size(vertical_text, size, available_height)
-            _draw_vertical_columns(draw, columns, font=self._font(size), left=left, top=top, width=right - left, height=bottom - top)
+            _draw_vertical_columns(draw, columns, font=self._font(size), left=left, top=top, width=right - left, height=bottom - top, fill=self._text_color(region))
 
     def _font_sizes(self, available_height: int) -> range:
-        return range(min(self._font_size, available_height), self._min_font_size - 1, -1)
+        return range(min(self._max_font_size, max(self._font_size, available_height)), self._min_font_size - 1, -1)
 
     def _font(self, size: int) -> ImageFont.FreeTypeFont:
         if size not in self._fonts:
-            self._fonts[size] = ImageFont.truetype(self._font_path, size)
+            self._fonts[size] = ImageFont.truetype(str(self._font_path), size)
         return self._fonts[size]
+
+
+def _stroke_info(fill: tuple[int, int, int], font_size: int) -> tuple[int, tuple[int, int, int]]:
+    """Determine stroke width and stroke color for text outline expansion."""
+    luma = 0.299 * fill[0] + 0.587 * fill[1] + 0.114 * fill[2]
+    stroke_fill = (255, 255, 255) if luma < 128 else (0, 0, 0)
+    stroke_width = max(2, min(6, font_size // 12))
+    return stroke_width, stroke_fill
 
 
 def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, width: int) -> str:
@@ -151,6 +181,7 @@ class MaskAwarePillowRenderer(PillowRenderer):
         x, y, width, height = cv2.boundingRect(mask)
         mask = mask[y : y + height, x : x + width]
         left, top = layout_left, layout_top
+        fill = self._text_color(region)
         if self._text_direction == "vertical-rtl":
             self._render_vertical_mask_region(draw, region, mask, left + x, top + y, width, height)
             return
@@ -162,13 +193,16 @@ class MaskAwarePillowRenderer(PillowRenderer):
             placement = _find_mask_placement(mask, text_width + self._padding * 2, text_height + self._padding * 2, _region_center(region.bbox, left + x, top + y))
             if placement is not None:
                 placement_x, placement_y = placement
+                sw, sf = _stroke_info(fill, font.size)
                 draw.multiline_text(
                     (left + x + placement_x + self._padding - bounds[0], top + y + placement_y + self._padding - bounds[1]),
                     text,
                     font=font,
-                    fill="black",
+                    fill=fill,
                     spacing=0,
                     align="center",
+                    stroke_width=sw,
+                    stroke_fill=sf,
                 )
                 return
         super()._render_region(draw, region)
@@ -189,12 +223,15 @@ class MaskAwarePillowRenderer(PillowRenderer):
             placements = _vertical_mask_layout(mask, vertical_text, self._font(size), self._padding, anchor)
             if placements is not None:
                 font = self._font(size)
+                fill = self._text_color(region)
+                sw, sf = _stroke_info(fill, font.size)
                 for column, column_x, column_y in placements:
                     for character in column:
-                        draw.text((left + column_x, top + column_y), character, font=font, fill="black")
+                        draw.text((left + column_x, top + column_y), character, font=font, fill=fill, stroke_width=sw, stroke_fill=sf)
                         column_y += size
                 return
         super()._render_region(draw, region)
+
 
 def _find_mask_placement(mask: np.ndarray, width: int, height: int, preferred_center: tuple[int, int]) -> tuple[int, int] | None:
     center_x, center_y = preferred_center
@@ -303,13 +340,9 @@ def _center_column_baselines(
 ) -> list[tuple[int, int, int]]:
     size = font.size
     count = len(column_ranges)
-    bounds = font.getbbox("中")
-    glyph_width = bounds[2] - bounds[0]
-    glyph_center_offset = bounds[0] + glyph_width / 2
-    return [
-        (round(anchor_x + (index - (count - 1) / 2) * size - glyph_center_offset), top, bottom)
-        for index, (_, top, bottom) in enumerate(column_ranges)
-    ]
+    center = (column_ranges[0][0] + column_ranges[-1][0] + size) / 2
+    offset = int(round(anchor_x - center))
+    return [(x + offset, top, bottom) for x, top, bottom in column_ranges]
 
 
 def _mask_column_ranges(mask: np.ndarray, size: int, padding: int) -> list[tuple[int, int, int]]:
@@ -358,13 +391,15 @@ def _draw_vertical_columns(
     top: int,
     width: int,
     height: int,
+    fill: tuple[int, int, int] = (0, 0, 0),
 ) -> None:
     size = font.size
+    sw, sf = _stroke_info(fill, size)
     x = left + width - size
     y = top + (height - max(len(column) for column in columns) * size) / 2
     for column in columns:
         for character in column:
-            draw.text((x, y), character, font=font, fill="black")
+            draw.text((x, y), character, font=font, fill=fill, stroke_width=sw, stroke_fill=sf)
             y += size
         x -= size
         y = top + (height - max(len(column) for column in columns) * size) / 2
