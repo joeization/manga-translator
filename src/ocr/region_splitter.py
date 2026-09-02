@@ -36,7 +36,7 @@ def split_text_regions(image: Image.Image, region: TextRegion) -> list[TextRegio
         )
         for group_left, group_top, group_right, group_bottom in groups
     ]
-    return _deduplicate_crop_candidates(candidates)
+    return _deduplicate_crop_candidates(_merge_overlapping_crop_candidates(candidates))
 
 
 def crop_for_ocr(image: Image.Image, region: TextRegion) -> Image.Image:
@@ -56,6 +56,47 @@ def _deduplicate_crop_candidates(candidates: list[TextRegion]) -> list[TextRegio
             continue
         kept.append(candidate)
     return sorted(kept, key=lambda region: (region.bbox[1], region.bbox[0]))
+
+
+def _merge_overlapping_crop_candidates(candidates: list[TextRegion]) -> list[TextRegion]:
+    """Merge split crops when their bounding boxes overlap by at least half of the smaller crop."""
+    remaining = list(candidates)
+    merged: list[TextRegion] = []
+    while remaining:
+        group = [remaining.pop(0)]
+        changed = True
+        while changed:
+            changed = False
+            for candidate in remaining[:]:
+                if any(_bbox_overlap_ratio(candidate.bbox, member.bbox) >= 0.5 for member in group):
+                    remaining.remove(candidate)
+                    group.append(candidate)
+                    changed = True
+        merged.append(_merge_crop_group(group))
+    return merged
+
+
+def _merge_crop_group(candidates: list[TextRegion]) -> TextRegion:
+    if len(candidates) == 1:
+        return candidates[0]
+    left = min(candidate.bbox[0] for candidate in candidates)
+    top = min(candidate.bbox[1] for candidate in candidates)
+    right = max(candidate.bbox[2] for candidate in candidates)
+    bottom = max(candidate.bbox[3] for candidate in candidates)
+    merged_bbox = (left, top, right, bottom)
+    merged_mask = np.zeros((bottom - top, right - left), dtype=bool)
+    for candidate in candidates:
+        if not isinstance(candidate.ocr_mask, np.ndarray):
+            continue
+        candidate_left, candidate_top, candidate_right, candidate_bottom = candidate.bbox
+        if candidate.ocr_mask.shape != (candidate_bottom - candidate_top, candidate_right - candidate_left):
+            continue
+        merged_mask[
+            candidate_top - top : candidate_bottom - top,
+            candidate_left - left : candidate_right - left,
+        ] |= candidate.ocr_mask
+    template = max(candidates, key=_valid_ink_area)
+    return replace(template, bbox=merged_bbox, source_bbox=merged_bbox, ocr_mask=merged_mask)
 
 
 def _is_redundant_crop(candidate: TextRegion, existing: TextRegion) -> bool:
@@ -139,9 +180,10 @@ def _group_components(components: list[tuple[int, int, int, int]], ink: np.ndarr
         return []
     widths = [right - left for left, _, right, _ in components]
     heights = [bottom - top for _, top, _, bottom in components]
-    # First link small glyphs and punctuation to their nearby text block.
-    kernel_width = max(1, round(float(np.median(widths)) * 1.5))
-    kernel_height = max(1, round(float(np.median(heights)) * 1.5))
+    # Link ordinary loose glyph spacing and punctuation before looking for a
+    # substantially wider blank band that indicates a separate text block.
+    kernel_width = max(1, round(float(np.median(widths)) * 2.0))
+    kernel_height = max(1, round(float(np.median(heights)) * 2.0))
     component_mask = np.zeros(ink.shape, dtype=np.uint8)
     for left, top, right, bottom in components:
         component_mask[top:bottom, left:right] = 255
@@ -174,7 +216,7 @@ def _split_group_at_blank_band(
     if not candidates:
         return [group]
     blank_band_ratio, direction, start, end = max(candidates)
-    if blank_band_ratio < 1.25:
+    if blank_band_ratio < 2.0:
         return [group]
     if direction == "vertical":
         return _trim_ink_bounds(cropped_ink[:, :start], left, top) + _trim_ink_bounds(cropped_ink[:, end:], left + end, top)

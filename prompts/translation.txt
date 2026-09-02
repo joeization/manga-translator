@@ -10,12 +10,14 @@ Rules:
 4. Preserve specific actions, objects, people, relationships, names, terminology, slang, vulgarity, and unusual expressions.
 5. Use the context to resolve obvious OCR errors or ambiguous wording, but do not guess when the meaning is uncertain.
 6. Preserve repetitions, incomplete sentences, interjections, and sound effects naturally.
-7. For sound effects and onomatopoeia, translate only when the meaning is clear. If uncertain or unusual, preserve only that fragment rather than guessing.
+7. For sound effects and onomatopoeia, translate only when the meaning is clear. If uncertain, preserve only that fragment rather than guessing.
 8. Never explain or annotate sound effects with parentheses or descriptions.
 9. Expand or interpret casual abbreviations, clipped greetings, and elongated spellings using the context before translating.
 10. Do not rewrite the text merely to make it more polished.
-11. When {{source_language}} and {{target_language}} differ, do not return the entire current input unchanged merely because it contains an unfamiliar, unusual, or untranslatable fragment. Translate every part whose meaning can be determined from the input or context.
-12. Output exactly one translation for the current input.
+11. If {{source_language}} and {{target_language}} are different, the final answer must be in {{target_language}}. Do not return the source text unchanged.
+12. Even if the input is unusual, ambiguous, short, or contains unfamiliar words, translate all parts whose meaning can be determined. Preserve only genuinely untranslatable fragments.
+13. Before responding, verify that you have actually translated the input into {{target_language}}.
+14. Output exactly one translation for the current input.
 
 Page context (reference only; do not translate or output it):
 {{context}}

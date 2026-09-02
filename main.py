@@ -185,7 +185,7 @@ def main() -> int:
         process_paths()
         return 1 if failures[0] else 0
     except Exception as error:
-        logging.exception("Failed to process %s\nStage: setup\nReason: %s", image_path.name, error)
+        logging.exception("Failed to initialize processing\nStage: setup\nReason: %s", error)
         return 1
 
 
