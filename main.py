@@ -8,7 +8,7 @@ from threading import Event, Thread
 
 from src.config import Settings
 from src.inpainting import NoopInpainter, OpenCVInpainter
-from src.ocr import HybridTextBubbleDetector, MangaOCR, Manga109BubbleSegmenter, Manga109YoloTextDetector
+from src.ocr import BaberuOCR, HybridTextBubbleDetector, MangaOCR, Manga109BubbleSegmenter, Manga109YoloTextDetector
 from src.pipeline import MangaTranslationPipeline, PipelineError, draw_debug_image, save_debug_image
 from src.renderer import MaskAwarePillowRenderer, OpenCVInkAnchorDetector, PillowRenderer
 from src.translator import OllamaCorrector, OllamaTranslator
@@ -88,6 +88,15 @@ def build_anchor_detector(settings: Settings) -> OpenCVInkAnchorDetector:
     return OpenCVInkAnchorDetector(settings.text_dark_threshold, settings.text_anchor_border_margin)
 
 
+def build_ocr(settings: Settings):
+    detector = build_region_detector(settings)
+    if settings.ocr_engine == "manga-ocr":
+        return MangaOCR(settings.ocr_model_dir, detector)
+    if settings.ocr_engine == "baberu":
+        return BaberuOCR(settings.ocr_model_dir / "baberu-ocr", detector)
+    raise RuntimeError(f"Unsupported OCR_ENGINE: {settings.ocr_engine}")
+
+
 def image_paths(arguments: argparse.Namespace) -> list[Path]:
     if arguments.file:
         return [arguments.file]
@@ -118,7 +127,7 @@ def main() -> int:
             settings.translation_prompt_path,
         )
         pipeline = MangaTranslationPipeline(
-            MangaOCR(settings.ocr_model_dir, build_region_detector(settings)),
+            build_ocr(settings),
             corrector,
             translator,
             build_inpainter(settings),

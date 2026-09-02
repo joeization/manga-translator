@@ -31,7 +31,7 @@ Local CLI tool that detects manga text, runs OCR and translation, removes the so
 
 5. Edit `.env`. At minimum, confirm that `OLLAMA_MODEL`, `FONT_PATH`, and all model paths match your computer.
 
-6. Provide the detection model weights. The text detection model must be at `models/manga109_yolo/model.pt`; the bubble segmentation model must be at `models/manga109-segmentation-bubble/best.pt`. The `manga-ocr-base` MangaOCR model is downloaded into `OCR_MODEL_DIR` on its first run.
+6. Provide the detection model weights. The text detection model must be at `models/manga109_yolo/model.pt`; the bubble segmentation model must be at `models/manga109-segmentation-bubble/best.pt`. The `manga-ocr-base` MangaOCR model is downloaded into `OCR_MODEL_DIR` on its first run. Baberu uses the local checkpoint at `OCR_MODEL_DIR/baberu-ocr`.
 
 ## Usage
 
@@ -77,14 +77,15 @@ All runtime settings are in `.env`:
 - `OUTPUT_DIR`, `OUTPUT_FORMAT`, `OUTPUT_JPEG_QUALITY`: Output location and JPEG quality.
 - `FONT_PATH`, `FONT_SIZE`, `MAX_FONT_SIZE`, `MIN_FONT_SIZE`, `TEXT_PADDING`: Render font and sizing.
 - `RENDERER_ENGINE`, `TEXT_DIRECTION`, `TEXT_ANCHOR_ENGINE`, `TEXT_ANCHOR_BORDER_MARGIN`: Text rendering and placement behavior.
-- `OCR_MODEL_DIR`: MangaOCR model directory.
+- `OCR_ENGINE`: `manga-ocr` (default) or `baberu`.
+- `OCR_MODEL_DIR`: Root directory for local OCR models. Baberu loads `baberu-ocr` beneath it.
 - `PIPELINE_MODE`: `two-stage` uses text detection; `one-stage` uses bubble segmentation; `hybrid` combines both.
 - `YOLO_MODEL_PATH`, `YOLO_CONFIDENCE`, `BUBBLE_MODEL_PATH`, `BUBBLE_CONFIDENCE`: Detection and bubble-segmentation model settings.
 - `INPAINT_ENABLED`, `INPAINT_ENGINE`, and the remaining `BUBBLE_`, `TEXT_DARK_`, `WHITE_BACKGROUND_`, `INPAINT_`, and `MASK_` settings: Source-text removal behavior.
 
 ### OCR Support
 
-The current OCR implementation uses MangaOCR, which is specialized for Japanese manga. Translating manga in other source languages or writing systems requires an OCR implementation trained for that language and an adapter that implements the project's OCR interface.
+`manga-ocr` is specialized for Japanese manga. Set `OCR_ENGINE=baberu` to use the included Baberu OCR checkpoint, which recognizes Japanese, Chinese, and English manga text. Both engines recognize each post-processed text region and implement the same pipeline OCR interface.
 
 ## Translation Rules
 

@@ -9,3 +9,4 @@ transformers
 manga-ocr
 ultralytics
 huggingface_hub
+safetensors

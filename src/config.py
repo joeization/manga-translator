@@ -28,6 +28,7 @@ class Settings:
     text_direction: str
     text_anchor_engine: str
     text_anchor_border_margin: int
+    ocr_engine: str
     ocr_model_dir: Path
     pipeline_mode: str
     yolo_model_path: Path
@@ -70,6 +71,7 @@ class Settings:
             text_direction=_required_setting("TEXT_DIRECTION").lower(),
             text_anchor_engine=_required_setting("TEXT_ANCHOR_ENGINE").lower(),
             text_anchor_border_margin=int(_required_setting("TEXT_ANCHOR_BORDER_MARGIN")),
+            ocr_engine=os.getenv("OCR_ENGINE", "manga-ocr").lower(),
             ocr_model_dir=_project_path(project_root, _required_setting("OCR_MODEL_DIR")),
             pipeline_mode=_required_setting("PIPELINE_MODE").lower(),
             yolo_model_path=_project_path(project_root, _required_setting("YOLO_MODEL_PATH")),

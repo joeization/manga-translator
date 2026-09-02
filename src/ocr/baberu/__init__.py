@@ -1,0 +1,1 @@
+"""Baberu model components vendored for local OCR inference."""
