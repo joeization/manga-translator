@@ -15,6 +15,7 @@ class Settings:
     source_language: str
     target_language: str
     translation_prompt_path: Path
+    correction_prompt_path: Path
     output_dir: Path
     output_format: str
     output_jpeg_quality: int
@@ -56,6 +57,7 @@ class Settings:
             source_language=_required_setting("SOURCE_LANGUAGE"),
             target_language=_required_setting("TARGET_LANGUAGE"),
             translation_prompt_path=_project_path(project_root, _required_setting("TRANSLATION_PROMPT_FILE")),
+            correction_prompt_path=_project_path(project_root, _required_setting("CORRECTION_PROMPT_FILE")),
             output_dir=_project_path(project_root, _required_setting("OUTPUT_DIR")),
             output_format=_required_setting("OUTPUT_FORMAT").lower(),
             output_jpeg_quality=int(_required_setting("OUTPUT_JPEG_QUALITY")),

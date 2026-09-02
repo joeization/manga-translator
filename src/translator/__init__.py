@@ -1,4 +1,4 @@
 from .base import Translator
-from .ollama import OllamaTranslator, TranslationError
+from .ollama import OllamaCorrector, OllamaTranslator, TranslationError
 
-__all__ = ["OllamaTranslator", "TranslationError", "Translator"]
+__all__ = ["OllamaCorrector", "OllamaTranslator", "TranslationError", "Translator"]

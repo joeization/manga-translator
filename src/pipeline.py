@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 from src.inpainting import Inpainter
 from src.models import OCRResult
 from src.renderer import Renderer, TextAnchorDetector
-from src.translator import Translator
+from src.translator import OllamaCorrector, Translator
 
 
 class PipelineError(RuntimeError):
@@ -21,8 +21,9 @@ class PipelineError(RuntimeError):
 
 
 class MangaTranslationPipeline:
-    def __init__(self, ocr: object, translator: Translator, inpainter: Inpainter, renderer: Renderer, anchor_detector: TextAnchorDetector) -> None:
+    def __init__(self, ocr: object, corrector: OllamaCorrector, translator: Translator, inpainter: Inpainter, renderer: Renderer, anchor_detector: TextAnchorDetector) -> None:
         self._ocr = ocr
+        self._corrector = corrector
         self._translator = translator
         self._inpainter = inpainter
         self._renderer = renderer
@@ -40,6 +41,15 @@ class MangaTranslationPipeline:
             _check_cancelled(cancel_event)
         except Exception as error:
             raise PipelineError("OCR", error) from error
+
+        try:
+            _check_cancelled(cancel_event)
+            corrections = self._corrector.correct([region.source_text for region in regions])
+            _check_cancelled(cancel_event)
+            for region, correction in zip(regions, corrections, strict=True):
+                region.source_text = correction
+        except Exception as error:
+            raise PipelineError("correction", error) from error
 
         try:
             _check_cancelled(cancel_event)

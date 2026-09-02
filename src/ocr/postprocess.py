@@ -10,13 +10,11 @@ from src.models import TextRegion
 @dataclass(frozen=True)
 class BubblePostprocessConfig:
     yolo_nms_iou: float = 0.5
-    bbox_merge_iou: float = 0.15
-    elongated_aspect_ratio: float = 2.0
-    elongated_cross_axis_overlap: float = 0.7
-    elongated_merge_gap_ratio: float = 0.35
-    mask_merge_iou: float = 0.15
-    elongated_mask_merge_gap_ratio: float = 0.25
+    segmentation_duplicate_iou: float = 0.6
     source_match_iou: float = 0.1
+    long_strip_aspect_ratio: float = 3.0
+    long_strip_cross_axis_overlap: float = 0.9
+    long_strip_gap_ratio: float = 0.12
 
 
 DEFAULT_CONFIG = BubblePostprocessConfig()
@@ -25,22 +23,27 @@ DEFAULT_CONFIG = BubblePostprocessConfig()
 def postprocess_bubbles(
     yolo_candidates: list[TextRegion], segmentation_candidates: list[TextRegion], config: BubblePostprocessConfig = DEFAULT_CONFIG
 ) -> list[TextRegion]:
-    yolo_bubbles = _merge_bbox_candidates(_non_maximum_suppression(yolo_candidates, config.yolo_nms_iou), config)
+    yolo_bubbles = _non_maximum_suppression(yolo_candidates, config.yolo_nms_iou)
     segmentation_bubbles = _merge_mask_candidates(segmentation_candidates, config)
     results: list[TextRegion] = []
     matched_segmentation: set[int] = set()
+    visited_yolo: set[int] = set()
+    matches_by_yolo = [
+        _best_matching_segmentation(yolo.bbox, segmentation_bubbles, config.source_match_iou) for yolo in yolo_bubbles
+    ]
 
-    for yolo in yolo_bubbles:
-        matches = [
-            index
-            for index, segmentation in enumerate(segmentation_bubbles)
-            if _matches_yolo(yolo.bbox, segmentation, config.source_match_iou)
-        ]
-        if not matches:
+    for yolo_index, yolo in enumerate(yolo_bubbles):
+        if yolo_index in visited_yolo:
+            continue
+        segmentation_index = matches_by_yolo[yolo_index]
+        if segmentation_index is None:
             results.append(TextRegion(bbox=yolo.bbox, source_text="", confidence=yolo.confidence))
             continue
-        matched_segmentation.update(matches)
-        segmentation = _merge_masks([segmentation_bubbles[index] for index in matches])
+        yolo_indices = _long_strip_component(yolo_index, yolo_bubbles, matches_by_yolo, config)
+        visited_yolo.update(yolo_indices)
+        matched_segmentation.add(segmentation_index)
+        segmentation = segmentation_bubbles[segmentation_index]
+        yolo = _merge_bboxes([yolo_bubbles[index] for index in yolo_indices])
         results.append(
             TextRegion(
                 bbox=segmentation.bbox,
@@ -56,16 +59,40 @@ def postprocess_bubbles(
     return sorted(results, key=lambda region: (region.bbox[1], region.bbox[0]))
 
 
+def _best_matching_segmentation(
+    yolo_bbox: tuple[int, int, int, int], segmentation_bubbles: list[TextRegion], minimum_iou: float
+) -> int | None:
+    matches = [
+        index
+        for index, segmentation in enumerate(segmentation_bubbles)
+        if _matches_yolo(yolo_bbox, segmentation, minimum_iou)
+    ]
+    return max(matches, key=lambda index: _match_score(yolo_bbox, segmentation_bubbles[index])) if matches else None
+
+
+def _long_strip_component(
+    start: int, yolo_bubbles: list[TextRegion], matches_by_yolo: list[int | None], config: BubblePostprocessConfig
+) -> set[int]:
+    matched_segmentation = matches_by_yolo[start]
+    component = {start}
+    changed = True
+    while changed:
+        changed = False
+        for index, candidate in enumerate(yolo_bubbles):
+            if index in component or matches_by_yolo[index] != matched_segmentation:
+                continue
+            if any(_is_same_long_strip(candidate.bbox, yolo_bubbles[member].bbox, config) for member in component):
+                component.add(index)
+                changed = True
+    return component
+
+
 def _non_maximum_suppression(candidates: list[TextRegion], threshold: float) -> list[TextRegion]:
     kept: list[TextRegion] = []
     for candidate in sorted(candidates, key=lambda region: region.confidence, reverse=True):
         if all(_bbox_iou(candidate.bbox, existing.bbox) < threshold for existing in kept):
             kept.append(candidate)
     return kept
-
-
-def _merge_bbox_candidates(candidates: list[TextRegion], config: BubblePostprocessConfig) -> list[TextRegion]:
-    return _merge_connected(candidates, lambda first, second: _should_merge_boxes(first.bbox, second.bbox, config), _merge_bboxes)
 
 
 def _merge_mask_candidates(candidates: list[TextRegion], config: BubblePostprocessConfig) -> list[TextRegion]:
@@ -89,32 +116,8 @@ def _merge_connected(candidates: list[TextRegion], matches: object, merge: objec
     return merged
 
 
-def _should_merge_boxes(first: tuple[int, int, int, int], second: tuple[int, int, int, int], config: BubblePostprocessConfig) -> bool:
-    if _bbox_iou(first, second) >= config.bbox_merge_iou:
-        return True
-    return _nearby_on_long_axis(first, second, config.elongated_merge_gap_ratio, config)
-
-
 def _should_merge_masks(first: TextRegion, second: TextRegion, config: BubblePostprocessConfig) -> bool:
-    if _mask_iou(first, second) >= config.mask_merge_iou:
-        return True
-    return _nearby_on_long_axis(first.bbox, second.bbox, config.elongated_mask_merge_gap_ratio, config)
-
-
-def _nearby_on_long_axis(
-    first: tuple[int, int, int, int], second: tuple[int, int, int, int], maximum_gap_ratio: float, config: BubblePostprocessConfig
-) -> bool:
-    first_width, first_height = first[2] - first[0], first[3] - first[1]
-    second_width, second_height = second[2] - second[0], second[3] - second[1]
-    vertical = first_height / first_width >= config.elongated_aspect_ratio and second_height / second_width >= config.elongated_aspect_ratio
-    horizontal = first_width / first_height >= config.elongated_aspect_ratio and second_width / second_height >= config.elongated_aspect_ratio
-    if vertical:
-        maximum_gap = min(first_height, second_height) * maximum_gap_ratio
-        return _interval_overlap_ratio(first[0], first[2], second[0], second[2]) >= config.elongated_cross_axis_overlap and _interval_gap(first[1], first[3], second[1], second[3]) <= maximum_gap
-    if horizontal:
-        maximum_gap = min(first_width, second_width) * maximum_gap_ratio
-        return _interval_overlap_ratio(first[1], first[3], second[1], second[3]) >= config.elongated_cross_axis_overlap and _interval_gap(first[0], first[2], second[0], second[2]) <= maximum_gap
-    return False
+    return _mask_iou(first, second) >= config.segmentation_duplicate_iou
 
 
 def _matches_yolo(yolo_bbox: tuple[int, int, int, int], segmentation: TextRegion, minimum_iou: float) -> bool:
@@ -126,6 +129,22 @@ def _matches_yolo(yolo_bbox: tuple[int, int, int, int], segmentation: TextRegion
     if left <= center_x < right and top <= center_y < bottom and segmentation.layout_mask[center_y - top, center_x - left]:
         return True
     return _bbox_iou(yolo_bbox, segmentation.bbox) >= minimum_iou
+
+
+def _match_score(yolo_bbox: tuple[int, int, int, int], segmentation: TextRegion) -> float:
+    return _bbox_iou(yolo_bbox, segmentation.bbox)
+
+
+def _is_same_long_strip(
+    first: tuple[int, int, int, int], second: tuple[int, int, int, int], config: BubblePostprocessConfig
+) -> bool:
+    first_width, first_height = first[2] - first[0], first[3] - first[1]
+    second_width, second_height = second[2] - second[0], second[3] - second[1]
+    if first_height / first_width >= config.long_strip_aspect_ratio and second_height / second_width >= config.long_strip_aspect_ratio:
+        return _interval_overlap_ratio(first[0], first[2], second[0], second[2]) >= config.long_strip_cross_axis_overlap and _interval_gap(first[1], first[3], second[1], second[3]) <= min(first_height, second_height) * config.long_strip_gap_ratio
+    if first_width / first_height >= config.long_strip_aspect_ratio and second_width / second_height >= config.long_strip_aspect_ratio:
+        return _interval_overlap_ratio(first[1], first[3], second[1], second[3]) >= config.long_strip_cross_axis_overlap and _interval_gap(first[0], first[2], second[0], second[2]) <= min(first_width, second_width) * config.long_strip_gap_ratio
+    return False
 
 
 def _merge_bboxes(candidates: list[TextRegion]) -> TextRegion:
@@ -192,3 +211,5 @@ def _interval_gap(first_start: int, first_end: int, second_start: int, second_en
 def _interval_overlap_ratio(first_start: int, first_end: int, second_start: int, second_end: int) -> float:
     overlap = max(0, min(first_end, second_end) - max(first_start, second_start))
     return overlap / min(first_end - first_start, second_end - second_start)
+
+

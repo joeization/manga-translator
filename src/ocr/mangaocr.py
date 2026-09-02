@@ -22,7 +22,7 @@ class MangaOCR:
         regions: list[OCRResult] = []
         for candidate in self._detector.detect(image):
             region = candidate if isinstance(candidate, OCRResult) else OCRResult(bbox=candidate, source_text="")
-            text = engine(image.crop(region.bbox)).strip()
+            text = engine(image.crop(region.source_bbox or region.bbox)).strip()
             if text:
                 region.source_text = text
                 regions.append(region)

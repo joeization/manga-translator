@@ -11,7 +11,7 @@ from src.inpainting import NoopInpainter, OpenCVInpainter
 from src.ocr import HybridTextBubbleDetector, MangaOCR, Manga109BubbleSegmenter, Manga109YoloTextDetector
 from src.pipeline import MangaTranslationPipeline, PipelineError, draw_debug_image, save_debug_image
 from src.renderer import MaskAwarePillowRenderer, OpenCVInkAnchorDetector, PillowRenderer
-from src.translator import OllamaTranslator
+from src.translator import OllamaCorrector, OllamaTranslator
 from src.viewer import ImageViewer
 
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
@@ -105,6 +105,11 @@ def main() -> int:
         if not paths or any(not path.is_file() for path in paths):
             raise RuntimeError("No supported image files were found.")
         settings = Settings.load(project_root)
+        corrector = OllamaCorrector(
+            settings.ollama_host,
+            settings.ollama_model,
+            settings.correction_prompt_path,
+        )
         translator = OllamaTranslator(
             settings.ollama_host,
             settings.ollama_model,
@@ -114,6 +119,7 @@ def main() -> int:
         )
         pipeline = MangaTranslationPipeline(
             MangaOCR(settings.ocr_model_dir, build_region_detector(settings)),
+            corrector,
             translator,
             build_inpainter(settings),
             build_renderer(settings),

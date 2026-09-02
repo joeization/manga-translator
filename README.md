@@ -86,31 +86,6 @@ All runtime settings are in `.env`:
 
 The current OCR implementation uses MangaOCR, which is specialized for Japanese manga. Translating manga in other source languages or writing systems requires an OCR implementation trained for that language and an adapter that implements the project's OCR interface.
 
-### Language Labels
-
-Ollama does not define a fixed set of translation language codes. This application substitutes the values of `SOURCE_LANGUAGE` and `TARGET_LANGUAGE` directly into the translation prompt. Use clear [BCP 47 language tags](https://www.rfc-editor.org/rfc/bcp/bcp47.txt) where possible:
-
-| Language | Recommended tag |
-| --- | --- |
-| Japanese | `ja` |
-| English | `en` |
-| Traditional Chinese | `zh-Hant` |
-| Simplified Chinese | `zh-Hans` |
-| Korean | `ko` |
-| French | `fr` |
-| German | `de` |
-| Spanish | `es` |
-| Italian | `it` |
-| Portuguese | `pt` |
-| Russian | `ru` |
-
-For Japanese-to-Traditional-Chinese manga translation, use:
-
-```env
-SOURCE_LANGUAGE=ja
-TARGET_LANGUAGE=zh-Hant
-```
-
 ## Translation Rules
 
 Edit [prompts/translation.txt](prompts/translation.txt) to adjust translation style. The `{{source_language}}` and `{{target_language}}` placeholders are replaced from `.env`. Keep the JSON-only output and response-format rules, or the program will be unable to parse translations.
