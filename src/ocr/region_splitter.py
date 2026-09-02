@@ -48,6 +48,35 @@ def crop_for_ocr(image: Image.Image, region: TextRegion) -> Image.Image:
     return Image.fromarray(pixels, mode="RGB")
 
 
+def sort_manga_reading_order(regions: list[TextRegion]) -> list[TextRegion]:
+    """Sort regions in Japanese manga reading order: Top-to-Bottom, Right-to-Left."""
+    if not regions:
+        return []
+    sorted_by_top = sorted(regions, key=lambda region: region.bbox[1])
+    rows: list[list[TextRegion]] = []
+    for region in sorted_by_top:
+        r_left, r_top, r_right, r_bottom = region.bbox
+        r_height = max(1, r_bottom - r_top)
+        placed = False
+        for row in rows:
+            row_top = min(member.bbox[1] for member in row)
+            row_bottom = max(member.bbox[3] for member in row)
+            row_height = max(1, row_bottom - row_top)
+            overlap_top = max(r_top, row_top)
+            overlap_bottom = min(r_bottom, row_bottom)
+            overlap = max(0, overlap_bottom - overlap_top)
+            if overlap >= min(r_height, row_height) * 0.4:
+                row.append(region)
+                placed = True
+                break
+        if not placed:
+            rows.append([region])
+    result: list[TextRegion] = []
+    for row in rows:
+        result.extend(sorted(row, key=lambda region: (-region.bbox[2], -region.bbox[0])))
+    return result
+
+
 def _deduplicate_crop_candidates(candidates: list[TextRegion]) -> list[TextRegion]:
     """Suppress duplicate crop geometry using actual source-ink overlap when available."""
     kept: list[TextRegion] = []
@@ -55,11 +84,11 @@ def _deduplicate_crop_candidates(candidates: list[TextRegion]) -> list[TextRegio
         if any(_is_redundant_crop(candidate, existing) for existing in kept):
             continue
         kept.append(candidate)
-    return sorted(kept, key=lambda region: (region.bbox[1], region.bbox[0]))
+    return sort_manga_reading_order(kept)
 
 
 def _merge_overlapping_crop_candidates(candidates: list[TextRegion]) -> list[TextRegion]:
-    """Merge split crops when their bounding boxes overlap by at least half of the smaller crop."""
+    """Merge split crops when their bounding boxes or ink masks overlap significantly."""
     remaining = list(candidates)
     merged: list[TextRegion] = []
     while remaining:
@@ -68,12 +97,36 @@ def _merge_overlapping_crop_candidates(candidates: list[TextRegion]) -> list[Tex
         while changed:
             changed = False
             for candidate in remaining[:]:
-                if any(_bbox_overlap_ratio(candidate.bbox, member.bbox) >= 0.5 for member in group):
+                if any(_should_merge_crop_candidates(candidate, member) for member in group):
                     remaining.remove(candidate)
                     group.append(candidate)
                     changed = True
         merged.append(_merge_crop_group(group))
     return merged
+
+
+def _should_merge_crop_candidates(first: TextRegion, second: TextRegion) -> bool:
+    if _bbox_overlap_ratio(first.bbox, second.bbox) >= 0.5:
+        return True
+    if _bbox_iou(first.bbox, second.bbox) >= 0.4:
+        return True
+    overlap = _ink_overlap(first, second)
+    if overlap is not None:
+        shared, first_ink, second_ink = overlap
+        min_ink = min(first_ink, second_ink)
+        if min_ink > 0 and shared / min_ink >= 0.5:
+            return True
+    return False
+
+
+def _bbox_iou(first: tuple[int, int, int, int], second: tuple[int, int, int, int]) -> float:
+    left, top = max(first[0], second[0]), max(first[1], second[1])
+    right, bottom = min(first[2], second[2]), min(first[3], second[3])
+    intersection = max(0, right - left) * max(0, bottom - top)
+    first_area = (first[2] - first[0]) * (first[3] - first[1])
+    second_area = (second[2] - second[0]) * (second[3] - second[1])
+    union = first_area + second_area - intersection
+    return intersection / union if union else 0.0
 
 
 def _merge_crop_group(candidates: list[TextRegion]) -> TextRegion:
@@ -182,8 +235,8 @@ def _group_components(components: list[tuple[int, int, int, int]], ink: np.ndarr
     heights = [bottom - top for _, top, _, bottom in components]
     # Link ordinary loose glyph spacing and punctuation before looking for a
     # substantially wider blank band that indicates a separate text block.
-    kernel_width = max(1, round(float(np.median(widths)) * 2.0))
-    kernel_height = max(1, round(float(np.median(heights)) * 2.0))
+    kernel_width = max(1, round(float(np.median(widths)) * 1.3))
+    kernel_height = max(1, round(float(np.median(heights)) * 1.3))
     component_mask = np.zeros(ink.shape, dtype=np.uint8)
     for left, top, right, bottom in components:
         component_mask[top:bottom, left:right] = 255
@@ -193,12 +246,39 @@ def _group_components(components: list[tuple[int, int, int, int]], ink: np.ndarr
     for label, (left, top, width, height, area) in enumerate(stats[1:count], start=1):
         if area <= kernel_width * kernel_height:
             continue
-        group = (left, top, left + width, top + height)
-        # Dilation can make bounding rectangles overlap even when their labels
-        # do not. Restrict the original ink to this label to prevent duplicate crops.
         group_ink = np.where(labels == label, ink, 0).astype(np.uint8)
+        trimmed = _trim_ink_bounds(group_ink, 0, 0)
+        if not trimmed:
+            continue
+        group = trimmed[0]
         groups.extend(_split_group_at_blank_band(group, group_ink, widths, heights))
-    return sorted(groups, key=lambda group: (group[1], group[0]))
+    return _sort_groups_manga_reading_order(groups)
+
+
+def _sort_groups_manga_reading_order(groups: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    if not groups:
+        return []
+    sorted_by_top = sorted(groups, key=lambda g: g[1])
+    rows: list[list[tuple[int, int, int, int]]] = []
+    for g in sorted_by_top:
+        g_left, g_top, g_right, g_bottom = g
+        g_height = max(1, g_bottom - g_top)
+        placed = False
+        for row in rows:
+            row_top = min(m[1] for m in row)
+            row_bottom = max(m[3] for m in row)
+            row_height = max(1, row_bottom - row_top)
+            overlap = max(0, min(g_bottom, row_bottom) - max(g_top, row_top))
+            if overlap >= min(g_height, row_height) * 0.4:
+                row.append(g)
+                placed = True
+                break
+        if not placed:
+            rows.append([g])
+    result: list[tuple[int, int, int, int]] = []
+    for row in rows:
+        result.extend(sorted(row, key=lambda g: (-g[2], -g[0])))
+    return result
 
 
 def _split_group_at_blank_band(
@@ -216,11 +296,18 @@ def _split_group_at_blank_band(
     if not candidates:
         return [group]
     blank_band_ratio, direction, start, end = max(candidates)
-    if blank_band_ratio < 2.0:
+    if blank_band_ratio < 1.3:
         return [group]
     if direction == "vertical":
-        return _trim_ink_bounds(cropped_ink[:, :start], left, top) + _trim_ink_bounds(cropped_ink[:, end:], left + end, top)
-    return _trim_ink_bounds(cropped_ink[:start, :], left, top) + _trim_ink_bounds(cropped_ink[end:, :], left, top + end)
+        parts = _trim_ink_bounds(cropped_ink[:, :start], left, top) + _trim_ink_bounds(cropped_ink[:, end:], left + end, top)
+    else:
+        parts = _trim_ink_bounds(cropped_ink[:start, :], left, top) + _trim_ink_bounds(cropped_ink[end:, :], left, top + end)
+
+    sub_groups: list[tuple[int, int, int, int]] = []
+    for part in parts:
+        part_ink = ink[part[1] : part[3], part[0] : part[2]]
+        sub_groups.extend(_split_group_at_blank_band(part, part_ink, widths, heights))
+    return sub_groups
 
 
 def _interior_blank_bands(projection: np.ndarray) -> list[tuple[int, int, int]]:

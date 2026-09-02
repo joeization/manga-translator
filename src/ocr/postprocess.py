@@ -56,7 +56,36 @@ def postprocess_bubbles(
         )
 
     results.extend(segmentation for index, segmentation in enumerate(segmentation_bubbles) if index not in matched_segmentation)
-    return sorted(results, key=lambda region: (region.bbox[1], region.bbox[0]))
+    return sort_manga_reading_order(results)
+
+
+def sort_manga_reading_order(regions: list[TextRegion]) -> list[TextRegion]:
+    """Sort regions in Japanese manga reading order: Top-to-Bottom, Right-to-Left."""
+    if not regions:
+        return []
+    sorted_by_top = sorted(regions, key=lambda region: region.bbox[1])
+    rows: list[list[TextRegion]] = []
+    for region in sorted_by_top:
+        r_left, r_top, r_right, r_bottom = region.bbox
+        r_height = max(1, r_bottom - r_top)
+        placed = False
+        for row in rows:
+            row_top = min(member.bbox[1] for member in row)
+            row_bottom = max(member.bbox[3] for member in row)
+            row_height = max(1, row_bottom - row_top)
+            overlap_top = max(r_top, row_top)
+            overlap_bottom = min(r_bottom, row_bottom)
+            overlap = max(0, overlap_bottom - overlap_top)
+            if overlap >= min(r_height, row_height) * 0.4:
+                row.append(region)
+                placed = True
+                break
+        if not placed:
+            rows.append([region])
+    result: list[TextRegion] = []
+    for row in rows:
+        result.extend(sorted(row, key=lambda region: (-region.bbox[2], -region.bbox[0])))
+    return result
 
 
 def _best_matching_segmentation(

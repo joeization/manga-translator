@@ -11,6 +11,39 @@ from src.models import TextRegion
 from .base import Renderer
 
 
+VERTICAL_PUNCTUATION_MAP = {
+    "\u300c": "\ufe41",  # 「 -> ﹁
+    "\u300d": "\ufe42",  # 」 -> ﹂
+    "\u300e": "\ufe43",  # 『 -> ﹃
+    "\u300f": "\ufe44",  # 』 -> ﹄
+    "\uff08": "\ufe35",  # （ -> ︵
+    "\uff09": "\ufe36",  # ） -> ︶
+    "\u3010": "\ufe3b",  # 【 -> ︻
+    "\u3011": "\ufe3c",  # 】 -> ︼
+    "\u300a": "\ufe3d",  # 《 -> ︽
+    "\u300b": "\ufe3e",  # 》 -> ︾
+    "\u3014": "\ufe39",  # 〔 -> ︹
+    "\u3015": "\ufe3a",  # 〕 -> ︺
+    "(": "\ufe35",       # ( -> ︵
+    ")": "\ufe36",       # ) -> ︶
+    "[": "\ufe39",       # [ -> ︹
+    "]": "\ufe3a",       # ] -> ︺
+    "~": "\ufe31",       # ~ -> ︱
+    "\uff5e": "\ufe31",  # ～ -> ︱
+    "\u301c": "\ufe31",  # 〜 -> ︱
+    "\u2015": "\ufe31",  # ― -> ︱
+    "\u2014": "\ufe31",  # — -> ︱
+    "-": "\ufe31",       # - -> ︱
+    "\u2026": "\ufe19",  # … -> ︙
+    "\u22ee": "\ufe19",  # ⋮ -> ︙
+}
+
+
+def to_vertical_text(text: str) -> str:
+    """Convert horizontal punctuation and brackets to vertical orientation symbols."""
+    return "".join(VERTICAL_PUNCTUATION_MAP.get(char, char) for char in text)
+
+
 class PillowRenderer(Renderer):
     def __init__(self, font_path: Path, font_size: int, max_font_size: int, min_font_size: int, padding: int, text_direction: str) -> None:
         self._font_path = font_path
@@ -53,15 +86,16 @@ class PillowRenderer(Renderer):
         left, top, right, bottom = region.bbox
         available_width = max(1, right - left - self._padding * 2)
         available_height = max(1, bottom - top - self._padding * 2)
+        vertical_text = to_vertical_text(region.translated_text or "")
         size = _largest_vertical_bbox_font_size(
-            region.translated_text or "",
+            vertical_text,
             min(self._font_size, available_height),
             self._min_font_size,
             available_width,
             available_height,
         )
         if size is not None:
-            columns = _vertical_columns_for_size(region.translated_text or "", size, available_height)
+            columns = _vertical_columns_for_size(vertical_text, size, available_height)
             _draw_vertical_columns(draw, columns, font=self._font(size), left=left, top=top, width=right - left, height=bottom - top)
 
     def _font_sizes(self, available_height: int) -> range:
@@ -148,7 +182,8 @@ class MaskAwarePillowRenderer(PillowRenderer):
     ) -> None:
         for size in self._font_sizes(height):
             anchor = _region_center(region.bbox, left, top)
-            placements = _vertical_mask_layout(mask, region.translated_text or "", self._font(size), self._padding, anchor)
+            vertical_text = to_vertical_text(region.translated_text or "")
+            placements = _vertical_mask_layout(mask, vertical_text, self._font(size), self._padding, anchor)
             if placements is not None:
                 font = self._font(size)
                 for column, column_x, column_y in placements:
