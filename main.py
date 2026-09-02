@@ -1,10 +1,19 @@
+"""
+Manga Translator CLI.
+Extracts text from manga pages/zips, translates via Ollama, erases original text,
+and renders translated text onto output images or displays in Manga Viewer.
+"""
 from __future__ import annotations
 
 import argparse
+import io
 import logging
+import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
 from threading import Event, Thread
+from typing import Callable
 
 from PIL import Image
 
@@ -20,14 +29,100 @@ SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 DETAIL_LOGGERS = ("src.ocr.mangaocr", "src.ocr.baberuocr", "src.translator.ollama")
 
 
+@dataclass
+class ImageItem:
+    """Represents an image item sourced from disk or directly from an in-memory zip archive."""
+
+    name: str
+    stem: str
+    load: Callable[[], Image.Image]
+    sub_dir: Path = Path("")
+
+
+import tkinter as tk
+from tkinter import filedialog, ttk
+
+
+def select_source_interactively() -> tuple[Path | None, Path | None]:
+    """Open a GUI dialog to let the user select a file, ZIP archive, or directory."""
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    choice = [None]
+    dialog = tk.Toplevel(root)
+    dialog.title("Manga Translator - Select Input Source")
+    dialog.geometry("380x150")
+    dialog.resizable(False, False)
+    try:
+        dialog.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    label = ttk.Label(dialog, text="Choose input source for Manga Translator:", font=("Segoe UI", 10))
+    label.pack(pady=15)
+
+    btn_frame = ttk.Frame(dialog)
+    btn_frame.pack(pady=10)
+
+    def on_file():
+        choice[0] = "file"
+        dialog.destroy()
+
+    def on_dir():
+        choice[0] = "dir"
+        dialog.destroy()
+
+    ttk.Button(btn_frame, text="📄 Select Image / ZIP", command=on_file, width=22).pack(side="left", padx=8)
+    ttk.Button(btn_frame, text="📁 Select Folder", command=on_dir, width=18).pack(side="right", padx=8)
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: dialog.destroy())
+    root.wait_window(dialog)
+
+    if choice[0] == "file":
+        selected_file = filedialog.askopenfilename(
+            title="Select Manga Image or ZIP Archive",
+            filetypes=[
+                ("Supported Files (.zip, .png, .jpg, .webp)", "*.zip *.png *.jpg *.jpeg *.webp"),
+                ("ZIP Archives (*.zip)", "*.zip"),
+                ("Image Files (*.png, *.jpg, *.webp)", "*.png *.jpg *.jpeg *.webp"),
+                ("All Files (*.*)", "*.*"),
+            ],
+        )
+        root.destroy()
+        return (Path(selected_file), None) if selected_file else (None, None)
+
+    if choice[0] == "dir":
+        selected_dir = filedialog.askdirectory(title="Select Manga Folder")
+        root.destroy()
+        return (None, Path(selected_dir)) if selected_dir else (None, None)
+
+    root.destroy()
+    return None, None
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract manga text and create an OCR debug image.")
-    sources = parser.add_mutually_exclusive_group(required=True)
-    sources.add_argument("--file", type=Path, help="PNG, JPG, or JPEG image to process")
-    sources.add_argument("--dir", type=Path, help="Directory containing PNG, JPG, or JPEG images")
+    sources = parser.add_mutually_exclusive_group(required=False)
+    sources.add_argument("--file", type=Path, help="Image file (.png, .jpg, .webp) or ZIP archive to process")
+    sources.add_argument("--dir", type=Path, help="Directory containing images or ZIP archives")
     parser.add_argument("--debug", action="store_true", help="Save an image annotated with YOLO and layout boxes")
     parser.add_argument("--show", action="store_true", help="Display results in memory without writing output files")
-    return parser.parse_args()
+    parser.add_argument("--show_orig", action="store_true", help="Display original and translated images side-by-side in --show mode")
+    args = parser.parse_args()
+
+    if not args.file and not args.dir:
+        file_path, dir_path = select_source_interactively()
+        if not file_path and not dir_path:
+            raise RuntimeError("No file, ZIP archive, or directory was selected.")
+        args.file = file_path
+        args.dir = dir_path
+        args.show = True
+
+    return args
 
 
 def build_inpainter(settings: Settings):
@@ -52,6 +147,7 @@ def build_inpainter(settings: Settings):
         )
     if settings.inpaint_engine == "lama":
         from src.inpainting import LamaInpainter
+
         lama_path = settings.lama_model_path
         if lama_path is None:
             raise RuntimeError("LAMA_MODEL_PATH must be set when INPAINT_ENGINE=lama")
@@ -72,7 +168,7 @@ def build_region_detector(settings: Settings):
     raise RuntimeError(f"Unsupported PIPELINE_MODE: {settings.pipeline_mode}")
 
 
-def save_output(image, output_path: Path, settings: Settings) -> None:
+def save_output(image: Image.Image, output_path: Path, settings: Settings) -> None:
     if settings.output_format in {"jpg", "jpeg"}:
         image.save(output_path, format="JPEG", quality=settings.output_jpeg_quality, optimize=True)
         return
@@ -110,12 +206,90 @@ def build_ocr(settings: Settings):
     raise RuntimeError(f"Unsupported OCR_ENGINE: {settings.ocr_engine}")
 
 
+def load_image_items(arguments: argparse.Namespace) -> list[ImageItem]:
+    """Resolve input image items from files, directories, or in-memory ZIP archives."""
+    items: list[ImageItem] = []
+
+    def _process_file(path: Path, relative_dir: Path = Path("")) -> list[ImageItem]:
+        res: list[ImageItem] = []
+        ext = path.suffix.lower()
+        if ext == ".zip":
+            try:
+                zf = zipfile.ZipFile(path, "r")
+                members = [
+                    m
+                    for m in zf.infolist()
+                    if not m.is_dir()
+                    and not Path(m.filename).name.startswith(".")
+                    and not m.filename.startswith("__MACOSX")
+                    and Path(m.filename).suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
+                ]
+                members.sort(key=lambda m: m.filename.lower())
+                zip_stem = path.stem
+                for m in members:
+                    member_path = Path(m.filename)
+
+                    def make_zip_loader(zip_p=path, member_name=m.filename):
+                        def loader() -> Image.Image:
+                            with zipfile.ZipFile(zip_p, "r") as z:
+                                data = z.read(member_name)
+                                return Image.open(io.BytesIO(data)).convert("RGB")
+
+                        return loader
+
+                    res.append(
+                        ImageItem(
+                            name=f"{zip_stem}/{member_path.name}",
+                            stem=member_path.stem,
+                            load=make_zip_loader(path, m.filename),
+                            sub_dir=relative_dir / zip_stem,
+                        )
+                    )
+            except Exception as error:
+                logging.error("Failed to open zip archive %s: %s", path.name, error)
+        elif ext in SUPPORTED_IMAGE_SUFFIXES:
+
+            def make_file_loader(file_p=path):
+                def loader() -> Image.Image:
+                    with Image.open(file_p) as img:
+                        return img.convert("RGB")
+
+                return loader
+
+            res.append(
+                ImageItem(
+                    name=path.name,
+                    stem=path.stem,
+                    load=make_file_loader(path),
+                    sub_dir=relative_dir,
+                )
+            )
+        return res
+
+    if arguments.file:
+        if not arguments.file.is_file():
+            raise RuntimeError(f"--file must name an existing file: {arguments.file}")
+        items.extend(_process_file(arguments.file))
+    elif arguments.dir:
+        if not arguments.dir.is_dir():
+            raise RuntimeError(f"--dir must name an existing directory: {arguments.dir}")
+        for path in sorted(arguments.dir.iterdir(), key=lambda p: p.name.lower()):
+            if path.is_file():
+                items.extend(_process_file(path))
+
+    return items
+
+
 def image_paths(arguments: argparse.Namespace) -> list[Path]:
+    """Legacy helper for backwards compatibility with tests."""
     if arguments.file:
         return [arguments.file]
-    if not arguments.dir.is_dir():
+    if not arguments.dir or not arguments.dir.is_dir():
         raise RuntimeError(f"--dir must name an existing directory: {arguments.dir}")
-    return sorted((path for path in arguments.dir.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES), key=lambda path: path.name.lower())
+    return sorted(
+        (path for path in arguments.dir.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES),
+        key=lambda path: path.name.lower(),
+    )
 
 
 def configure_logging(debug: bool) -> None:
@@ -151,9 +325,10 @@ def main() -> int:
     configure_logging(arguments.debug)
     project_root = Path(__file__).resolve().parent
     try:
-        paths = image_paths(arguments)
-        if not paths or any(not path.is_file() for path in paths):
-            raise RuntimeError("No supported image files were found.")
+        items = load_image_items(arguments)
+        if not items:
+            raise RuntimeError("No supported image files or ZIP contents were found.")
+
         settings = Settings.load(project_root)
         corrector = OllamaCorrector(
             settings.ollama_host,
@@ -180,36 +355,40 @@ def main() -> int:
         images: Queue = Queue()
         failures = [0]
         cancel_event = Event()
+
         def process_paths() -> None:
-            for number, image_path in enumerate(paths, start=1):
+            for number, item in enumerate(items, start=1):
                 if cancel_event.is_set():
                     logging.info("Viewer closed. Cancelling remaining images.")
                     break
-                logging.info("[%d/%d] %s", number, len(paths), image_path.name)
+                logging.info("[%d/%d] %s", number, len(items), item.name)
                 try:
-                    with Image.open(image_path) as source:
-                        original_image = source.convert("RGB")
+                    original_image = item.load()
                     translated_image, regions = pipeline.process(original_image.copy(), cancel_event)
                     for index, region in enumerate(regions, start=1):
                         logging.info("  [%d] %s -> %s", index, region.source_text, region.translated_text)
                     if arguments.show:
                         right_image = draw_debug_image(translated_image, regions) if arguments.debug else translated_image
-                        images.put(build_side_by_side_image(original_image, right_image))
+                        if arguments.show_orig:
+                            images.put(build_side_by_side_image(original_image, right_image))
+                        else:
+                            images.put(right_image)
                     else:
-                        output_path = settings.output_dir / f"{image_path.stem}_translated.{settings.output_format}"
+                        out_dir = settings.output_dir / item.sub_dir
+                        output_path = out_dir / f"{item.stem}_translated.{settings.output_format}"
                         output_path.parent.mkdir(parents=True, exist_ok=True)
                         save_output(translated_image, output_path, settings)
                         logging.info("  Saved: %s", output_path)
                         if arguments.debug:
-                            debug_path = settings.output_dir / f"{image_path.stem}_translated_debug.{settings.output_format}"
+                            debug_path = out_dir / f"{item.stem}_translated_debug.{settings.output_format}"
                             save_debug_image(translated_image, regions, debug_path)
                             logging.info("  Saved debug image: %s", debug_path)
                 except PipelineError as error:
                     failures[0] += 1
-                    logging.error("Failed to process %s\nStage: %s\nReason: %s", image_path.name, error.stage, error.error)
+                    logging.error("Failed to process %s\nStage: %s\nReason: %s", item.name, error.stage, error.error)
                 except Exception as error:
                     failures[0] += 1
-                    logging.exception("Failed to process %s\nStage: setup\nReason: %s", image_path.name, error)
+                    logging.exception("Failed to process %s\nStage: setup\nReason: %s", item.name, error)
 
         if arguments.show:
             worker = Thread(target=process_paths, daemon=True)

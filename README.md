@@ -1,6 +1,6 @@
 # Manga Translator
 
-Local CLI tool that detects manga text, runs OCR and translation, erases original text using neural/OpenCV inpainting, and renders translated text cleanly into the image.
+Local CLI & GUI tool that detects manga text, runs OCR and translation via Ollama, erases original text using LaMa neural GPU or OpenCV inpainting, and renders translated text with automatic stroke outlines.
 
 ## Prerequisites
 
@@ -11,7 +11,7 @@ Local CLI tool that detects manga text, runs OCR and translation, erases origina
    conda activate manga-translator
    ```
 
-2. Install Python dependencies (including ONNX Runtime GPU support):
+2. Install Python dependencies (including ONNX Runtime GPU support for CUDA 12):
 
    ```powershell
    python -m pip install -r requirements.txt
@@ -29,9 +29,7 @@ Local CLI tool that detects manga text, runs OCR and translation, erases origina
    Copy-Item .env.example .env
    ```
 
-5. Edit `.env` to verify paths, Ollama model, and font path.
-
-6. Model Files Setup:
+5. Model Files Setup:
    - Text detection: `models/manga109_yolo/model.pt`
    - Bubble segmentation: `models/manga109-segmentation-bubble/best.pt`
    - OCR model: `models/baberu-ocr`
@@ -39,28 +37,45 @@ Local CLI tool that detects manga text, runs OCR and translation, erases origina
 
 ## Usage
 
-Process one image and write the result to `OUTPUT_DIR`:
+### Interactive GUI Mode
+
+Run without arguments to launch native Windows file/directory selection dialogs:
 
 ```powershell
-python main.py --file path/to/page.jpg
+python main.py
 ```
 
-Process every `.png`, `.jpg`, and `.webp` image in a directory:
+### Command Line Mode
+
+Process an image file or ZIP archive directly in memory:
+
+```powershell
+python main.py --file path/to/manga.zip
+```
+
+Process every image or ZIP archive in a directory:
 
 ```powershell
 python main.py --dir path/to/manga
 ```
 
-Use `--debug` to also write an annotated debug image showing detection regions:
+### Options & Viewer
+
+- `--show`: Display translated results in memory using the interactive Manga Viewer without saving files to disk.
+- `--show_orig`: Enable side-by-side comparison mode (**Original image left**, **Translated image right**) in `--show` mode.
+- `--debug`: Generate debug overlay showing detected text regions and bubble segmentations.
+
+Examples:
 
 ```powershell
+# Single page or ZIP viewer
+python main.py --file path/to/manga.zip --show
+
+# Side-by-side viewer (Left: Original, Right: Translated)
+python main.py --file path/to/manga.zip --show --show_orig
+
+# Debug overlay with file output
 python main.py --file path/to/page.jpg --debug
-```
-
-Use `--show` to display results interactively in the Manga Viewer:
-
-```powershell
-python main.py --dir path/to/manga --show --debug
 ```
 
 ## Configuration

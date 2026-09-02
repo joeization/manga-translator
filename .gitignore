@@ -1,14 +1,26 @@
+# Environment & secrets
 .env
+.env.local
+
+# Python caches & build artifacts
 __pycache__/
 *.py[cod]
 .pytest_cache/
-res/input/
-res/output/
-output/*
-!output/.gitkeep
+.coverage
+htmlcov/
+
+# Local model binaries & large data
 models/*
 !models/.gitkeep
-test/*
+
+# Output directories & input scratch
+output/*
+!output/.gitkeep
+res/input/
+res/output/
+
+# Temporary worklogs and task scratch
 impl.md
 WORKLOG.md
-tasks/*
+tasks/
+test/*

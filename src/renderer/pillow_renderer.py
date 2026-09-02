@@ -1,7 +1,7 @@
 """
 Pillow-based renderer for placing translated text onto images.
 Supports horizontal and vertical-rtl text directions, mask-aware bubble layout,
-and automatic white/dark stroke outline rendering.
+and two-pass outward-only white/dark stroke outline rendering.
 """
 from __future__ import annotations
 
@@ -103,8 +103,7 @@ class PillowRenderer(Renderer):
             if text_width <= available_width and text_height <= available_height:
                 x = left + (right - left - text_width) / 2 - bounds[0]
                 y = top + (bottom - top - text_height) / 2 - bounds[1]
-                sw, sf = _stroke_info(fill, font.size)
-                draw.multiline_text((x, y), text, font=font, fill=fill, spacing=0, align="center", stroke_width=sw, stroke_fill=sf)
+                _draw_text_with_stroke(draw, (x, y), text, font, fill, is_multiline=True)
                 return
 
     def _render_vertical_region(self, draw: ImageDraw.ImageDraw, region: TextRegion) -> None:
@@ -136,8 +135,32 @@ def _stroke_info(fill: tuple[int, int, int], font_size: int) -> tuple[int, tuple
     """Determine stroke width and stroke color for text outline expansion."""
     luma = 0.299 * fill[0] + 0.587 * fill[1] + 0.114 * fill[2]
     stroke_fill = (255, 255, 255) if luma < 128 else (0, 0, 0)
-    stroke_width = max(2, min(6, font_size // 12))
+    stroke_width = max(2, min(5, font_size // 14))
     return stroke_width, stroke_fill
+
+
+def _draw_text_with_stroke(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[float, float],
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    fill: tuple[int, int, int],
+    is_multiline: bool = False,
+    spacing: float = 0,
+    align: str = "center",
+) -> None:
+    """Two-pass text rendering: draws outer stroke first, then draws inner font body on top."""
+    sw, sf = _stroke_info(fill, font.size)
+    if sw > 0:
+        if is_multiline:
+            draw.multiline_text(xy, text, font=font, fill=sf, spacing=spacing, align=align, stroke_width=sw, stroke_fill=sf)
+        else:
+            draw.text(xy, text, font=font, fill=sf, stroke_width=sw, stroke_fill=sf)
+    # Pass 2: Crisp inner body fill drawn on top with stroke_width=0
+    if is_multiline:
+        draw.multiline_text(xy, text, font=font, fill=fill, spacing=spacing, align=align, stroke_width=0)
+    else:
+        draw.text(xy, text, font=font, fill=fill, stroke_width=0)
 
 
 def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, width: int) -> str:
@@ -193,17 +216,8 @@ class MaskAwarePillowRenderer(PillowRenderer):
             placement = _find_mask_placement(mask, text_width + self._padding * 2, text_height + self._padding * 2, _region_center(region.bbox, left + x, top + y))
             if placement is not None:
                 placement_x, placement_y = placement
-                sw, sf = _stroke_info(fill, font.size)
-                draw.multiline_text(
-                    (left + x + placement_x + self._padding - bounds[0], top + y + placement_y + self._padding - bounds[1]),
-                    text,
-                    font=font,
-                    fill=fill,
-                    spacing=0,
-                    align="center",
-                    stroke_width=sw,
-                    stroke_fill=sf,
-                )
+                pos = (left + x + placement_x + self._padding - bounds[0], top + y + placement_y + self._padding - bounds[1])
+                _draw_text_with_stroke(draw, pos, text, font, fill, is_multiline=True)
                 return
         super()._render_region(draw, region)
 
@@ -224,10 +238,9 @@ class MaskAwarePillowRenderer(PillowRenderer):
             if placements is not None:
                 font = self._font(size)
                 fill = self._text_color(region)
-                sw, sf = _stroke_info(fill, font.size)
                 for column, column_x, column_y in placements:
                     for character in column:
-                        draw.text((left + column_x, top + column_y), character, font=font, fill=fill, stroke_width=sw, stroke_fill=sf)
+                        _draw_text_with_stroke(draw, (left + column_x, top + column_y), character, font, fill, is_multiline=False)
                         column_y += size
                 return
         super()._render_region(draw, region)
@@ -394,12 +407,11 @@ def _draw_vertical_columns(
     fill: tuple[int, int, int] = (0, 0, 0),
 ) -> None:
     size = font.size
-    sw, sf = _stroke_info(fill, size)
     x = left + width - size
     y = top + (height - max(len(column) for column in columns) * size) / 2
     for column in columns:
         for character in column:
-            draw.text((x, y), character, font=font, fill=fill, stroke_width=sw, stroke_fill=sf)
+            _draw_text_with_stroke(draw, (x, y), character, font, fill, is_multiline=False)
             y += size
         x -= size
         y = top + (height - max(len(column) for column in columns) * size) / 2
