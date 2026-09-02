@@ -16,6 +16,7 @@ from threading import Event, Thread
 from typing import Callable
 
 from PIL import Image
+from tqdm import tqdm
 
 from src.config import Settings
 from src.inpainting import NoopInpainter, OpenCVInpainter
@@ -357,16 +358,23 @@ def main() -> int:
         cancel_event = Event()
 
         def process_paths() -> None:
-            for number, item in enumerate(items, start=1):
+            iterator = tqdm(items, desc="Translating manga", unit="page") if not arguments.debug else items
+            for number, item in enumerate(iterator, start=1):
                 if cancel_event.is_set():
-                    logging.info("Viewer closed. Cancelling remaining images.")
+                    if arguments.debug:
+                        logging.info("Viewer closed. Cancelling remaining images.")
                     break
-                logging.info("[%d/%d] %s", number, len(items), item.name)
+                if arguments.debug:
+                    logging.info("[%d/%d] %s", number, len(items), item.name)
+                elif hasattr(iterator, "set_postfix_str"):
+                    iterator.set_postfix_str(item.name)
+
                 try:
                     original_image = item.load()
                     translated_image, regions = pipeline.process(original_image.copy(), cancel_event)
-                    for index, region in enumerate(regions, start=1):
-                        logging.info("  [%d] %s -> %s", index, region.source_text, region.translated_text)
+                    if arguments.debug:
+                        for index, region in enumerate(regions, start=1):
+                            logging.info("  [%d] %s -> %s", index, region.source_text, region.translated_text)
                     if arguments.show:
                         right_image = draw_debug_image(translated_image, regions) if arguments.debug else translated_image
                         if arguments.show_orig:
@@ -378,8 +386,8 @@ def main() -> int:
                         output_path = out_dir / f"{item.stem}_translated.{settings.output_format}"
                         output_path.parent.mkdir(parents=True, exist_ok=True)
                         save_output(translated_image, output_path, settings)
-                        logging.info("  Saved: %s", output_path)
                         if arguments.debug:
+                            logging.info("  Saved: %s", output_path)
                             debug_path = out_dir / f"{item.stem}_translated_debug.{settings.output_format}"
                             save_debug_image(translated_image, regions, debug_path)
                             logging.info("  Saved debug image: %s", debug_path)
