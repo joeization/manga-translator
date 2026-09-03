@@ -362,26 +362,37 @@ def main() -> int:
         cancel_event = Event()
 
         def process_paths() -> None:
-            iterator = tqdm(items, desc="Translating manga", unit="page") if not arguments.debug else items
-            for number, item in enumerate(iterator, start=1):
-                if cancel_event.is_set():
-                    if arguments.debug:
-                        logging.info("Viewer closed. Cancelling remaining images.")
-                    break
-                if arguments.debug:
-                    logging.info("[%d/%d] %s", number, len(items), item.name)
-                elif hasattr(iterator, "set_postfix_str"):
-                    iterator.set_postfix_str(item.name)
+            pbar = tqdm(total=len(items), desc="Translating manga", unit="page") if not arguments.debug else None
+            try:
+                for item, original_image, translated_image, regions, error in pipeline.process_pipelined(
+                    items, cancel_event=cancel_event
+                ):
+                    if cancel_event.is_set():
+                        if arguments.debug:
+                            logging.info("Viewer closed. Cancelling remaining images.")
+                        break
 
-                try:
-                    original_image = item.load()
-                    translated_image, regions = pipeline.process(original_image.copy(), cancel_event)
+                    if error is not None:
+                        failures[0] += 1
+                        logging.error("Failed to process %s\nStage: %s\nReason: %s", item.name, error.stage, error.error)
+                        if pbar:
+                            pbar.update(1)
+                        continue
+
                     if arguments.debug:
+                        logging.info("[%s] %s", item.stem, item.name)
                         for index, region in enumerate(regions, start=1):
                             logging.info("  [%d] %s -> %s", index, region.source_text, region.translated_text)
+                    elif pbar:
+                        pbar.update(1)
+                        pbar.set_postfix_str(item.name)
+
+                    if translated_image is None:
+                        continue
+
                     if arguments.show:
                         right_image = draw_debug_image(translated_image, regions) if arguments.debug else translated_image
-                        if arguments.show_orig:
+                        if arguments.show_orig and original_image is not None:
                             images.put(build_side_by_side_image(original_image, right_image))
                         else:
                             images.put(right_image)
@@ -395,12 +406,9 @@ def main() -> int:
                             debug_path = out_dir / f"{item.stem}_translated_debug.{settings.output_format}"
                             save_debug_image(translated_image, regions, debug_path)
                             logging.info("  Saved debug image: %s", debug_path)
-                except PipelineError as error:
-                    failures[0] += 1
-                    logging.error("Failed to process %s\nStage: %s\nReason: %s", item.name, error.stage, error.error)
-                except Exception as error:
-                    failures[0] += 1
-                    logging.exception("Failed to process %s\nStage: setup\nReason: %s", item.name, error)
+            finally:
+                if pbar:
+                    pbar.close()
 
         def run_processing() -> None:
             if not arguments.debug:

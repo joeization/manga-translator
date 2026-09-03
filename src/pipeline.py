@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Event
+from queue import Queue
+from threading import Event, Thread
+from typing import Any
 
 import cv2
 import numpy as np
@@ -14,6 +18,26 @@ from src.renderer import Renderer, TextAnchorDetector
 from src.translator import OllamaCorrector, Translator
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PipelinePacket:
+    index: int
+    item: Any
+    original_image: Image.Image | None = None
+    regions: list[OCRResult] = field(default_factory=list)
+    inpainted_image: Image.Image | None = None
+    translated_image: Image.Image | None = None
+    error: PipelineError | None = None
+
+
+def _drain_queue(q: Queue) -> None:
+    try:
+        while not q.empty():
+            q.get_nowait()
+            q.task_done()
+    except Exception:
+        pass
 
 
 class PipelineError(RuntimeError):
@@ -38,14 +62,18 @@ class MangaTranslationPipeline:
             image = source.convert("RGB")
         return self.process(image, cancel_event)
 
-    def process(self, image: Image.Image, cancel_event: Event | None = None) -> tuple[Image.Image, list[OCRResult]]:
+    def _run_ocr(self, image: Image.Image, cancel_event: Event | None = None) -> list[OCRResult]:
         try:
             _check_cancelled(cancel_event)
             regions = self._ocr.detect(image)
             _check_cancelled(cancel_event)
+            return regions
         except Exception as error:
             raise PipelineError("OCR", error) from error
 
+    def _run_translation(
+        self, image: Image.Image, regions: list[OCRResult], cancel_event: Event | None = None
+    ) -> tuple[list[OCRResult], bool]:
         try:
             _check_cancelled(cancel_event)
             original_ocr_texts = [region.source_text for region in regions]
@@ -70,29 +98,172 @@ class MangaTranslationPipeline:
             )
             for region, translation in zip(translatable_regions, translations, strict=True):
                 region.translated_text = translation
+            return translatable_regions, False
         except Exception as error:
             logger.warning("Translation failed; saving the original image instead: %s", error)
-            return image, []
+            return [], True
 
-        _check_cancelled(cancel_event)
-
+    def _run_inpaint(
+        self, image: Image.Image, regions: list[OCRResult], cancel_event: Event | None = None
+    ) -> Image.Image:
         try:
             _check_cancelled(cancel_event)
-            self._anchor_detector.detect(image, translatable_regions)
+            self._anchor_detector.detect(image, regions)
         except Exception as error:
             raise PipelineError("text anchoring", error) from error
 
         try:
             _check_cancelled(cancel_event)
-            image = self._inpainter.inpaint(image, translatable_regions)
+            return self._inpainter.inpaint(image, regions)
         except Exception as error:
             raise PipelineError("inpainting", error) from error
 
+    def _run_render(
+        self, image: Image.Image, regions: list[OCRResult], cancel_event: Event | None = None
+    ) -> Image.Image:
         try:
             _check_cancelled(cancel_event)
-            return self._renderer.render(image, translatable_regions), translatable_regions
+            return self._renderer.render(image, regions)
         except Exception as error:
             raise PipelineError("rendering", error) from error
+
+    def process(self, image: Image.Image, cancel_event: Event | None = None) -> tuple[Image.Image, list[OCRResult]]:
+        regions = self._run_ocr(image, cancel_event)
+        translatable_regions, failed = self._run_translation(image, regions, cancel_event)
+        if failed:
+            return image, []
+        _check_cancelled(cancel_event)
+        inpainted_image = self._run_inpaint(image, translatable_regions, cancel_event)
+        _check_cancelled(cancel_event)
+        rendered_image = self._run_render(inpainted_image, translatable_regions, cancel_event)
+        return rendered_image, translatable_regions
+
+    def process_pipelined(
+        self,
+        items: list[Any],
+        cancel_event: Event | None = None,
+        queue_size: int = 2,
+    ) -> Iterator[tuple[Any, Image.Image | None, Image.Image | None, list[OCRResult], PipelineError | None]]:
+        if not items:
+            return
+
+        q_ocr_to_trans: Queue[_PipelinePacket | None] = Queue(maxsize=queue_size)
+        q_trans_to_inpaint: Queue[_PipelinePacket | None] = Queue(maxsize=queue_size)
+        q_inpaint_to_render: Queue[_PipelinePacket | None] = Queue(maxsize=queue_size)
+        q_render_to_out: Queue[_PipelinePacket | None] = Queue(maxsize=queue_size)
+
+        def ocr_worker() -> None:
+            for idx, item in enumerate(items):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                packet = _PipelinePacket(index=idx, item=item)
+                try:
+                    img = item.load() if hasattr(item, "load") else item
+                    packet.original_image = img
+                    packet.regions = self._run_ocr(img, cancel_event)
+                except PipelineError as err:
+                    packet.error = err
+                except Exception as err:
+                    packet.error = PipelineError("OCR", err)
+                q_ocr_to_trans.put(packet)
+            q_ocr_to_trans.put(None)
+
+        def trans_worker() -> None:
+            while True:
+                packet = q_ocr_to_trans.get()
+                if packet is None:
+                    q_trans_to_inpaint.put(None)
+                    q_ocr_to_trans.task_done()
+                    break
+                if cancel_event is not None and cancel_event.is_set():
+                    q_trans_to_inpaint.put(None)
+                    q_ocr_to_trans.task_done()
+                    break
+                if packet.error is None and packet.original_image is not None:
+                    try:
+                        translatable, failed = self._run_translation(packet.original_image, packet.regions, cancel_event)
+                        if failed:
+                            packet.regions = []
+                            packet.translated_image = packet.original_image
+                        else:
+                            packet.regions = translatable
+                    except PipelineError as err:
+                        packet.error = err
+                    except Exception as err:
+                        packet.error = PipelineError("translation", err)
+                q_trans_to_inpaint.put(packet)
+                q_ocr_to_trans.task_done()
+
+        def inpaint_worker() -> None:
+            while True:
+                packet = q_trans_to_inpaint.get()
+                if packet is None:
+                    q_inpaint_to_render.put(None)
+                    q_trans_to_inpaint.task_done()
+                    break
+                if cancel_event is not None and cancel_event.is_set():
+                    q_inpaint_to_render.put(None)
+                    q_trans_to_inpaint.task_done()
+                    break
+                if packet.error is None and packet.original_image is not None and packet.translated_image is None:
+                    try:
+                        packet.inpainted_image = self._run_inpaint(packet.original_image.copy(), packet.regions, cancel_event)
+                    except PipelineError as err:
+                        packet.error = err
+                    except Exception as err:
+                        packet.error = PipelineError("inpainting", err)
+                else:
+                    packet.inpainted_image = packet.original_image
+                q_inpaint_to_render.put(packet)
+                q_trans_to_inpaint.task_done()
+
+        def render_worker() -> None:
+            while True:
+                packet = q_inpaint_to_render.get()
+                if packet is None:
+                    q_render_to_out.put(None)
+                    q_inpaint_to_render.task_done()
+                    break
+                if cancel_event is not None and cancel_event.is_set():
+                    q_render_to_out.put(None)
+                    q_inpaint_to_render.task_done()
+                    break
+                if packet.error is None and packet.inpainted_image is not None and packet.translated_image is None:
+                    try:
+                        packet.translated_image = self._run_render(packet.inpainted_image, packet.regions, cancel_event)
+                    except PipelineError as err:
+                        packet.error = err
+                    except Exception as err:
+                        packet.error = PipelineError("rendering", err)
+                elif packet.translated_image is None:
+                    packet.translated_image = packet.original_image
+                q_render_to_out.put(packet)
+                q_inpaint_to_render.task_done()
+
+        threads = [
+            Thread(target=ocr_worker, daemon=True),
+            Thread(target=trans_worker, daemon=True),
+            Thread(target=inpaint_worker, daemon=True),
+            Thread(target=render_worker, daemon=True),
+        ]
+        for t in threads:
+            t.start()
+
+        try:
+            while True:
+                packet = q_render_to_out.get()
+                if packet is None:
+                    q_render_to_out.task_done()
+                    break
+                yield packet.item, packet.original_image, packet.translated_image, packet.regions, packet.error
+                q_render_to_out.task_done()
+        finally:
+            _drain_queue(q_ocr_to_trans)
+            _drain_queue(q_trans_to_inpaint)
+            _drain_queue(q_inpaint_to_render)
+            _drain_queue(q_render_to_out)
+            for t in threads:
+                t.join(timeout=1.0)
 
 
 def _check_cancelled(cancel_event: Event | None) -> None:
