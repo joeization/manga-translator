@@ -5,5 +5,5 @@ from abc import ABC, abstractmethod
 
 class Translator(ABC):
     @abstractmethod
-    def translate(self, texts: list[str], context_texts: list[str] | None = None) -> list[str]:
-        """Translate texts while preserving input order and optionally using page context."""
+    def translate(self, texts: list[str], context: str | list[str] | None = None) -> list[str]:
+        """Translate texts while preserving input order and optionally using context."""

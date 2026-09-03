@@ -82,7 +82,7 @@ python main.py --file path/to/page.jpg --debug
 
 All runtime settings are configured in `.env` (copy from `.env.example`):
 
-- **Translation**: `OLLAMA_HOST`, `OLLAMA_MODEL`, `SOURCE_LANGUAGE`, `TARGET_LANGUAGE`, `TRANSLATION_PROMPT_FILE`, `CORRECTION_PROMPT_FILE`.
+- **Translation**: `OLLAMA_HOST`, `OLLAMA_MODEL`, `SOURCE_LANGUAGE`, `TARGET_LANGUAGE`, `TRANSLATION_PROMPT_FILE`.
 - **Output**: `OUTPUT_DIR`, `OUTPUT_FORMAT`, `OUTPUT_JPEG_QUALITY`.
 - **Rendering**: `FONT_PATH`, `FONT_SIZE`, `MAX_FONT_SIZE`, `MIN_FONT_SIZE`, `TEXT_PADDING`, `RENDERER_ENGINE`, `TEXT_DIRECTION`, `TEXT_ANCHOR_ENGINE`.
 - **OCR**: `OCR_ENGINE` (`baberu` / `manga-ocr`), `OCR_MODEL_DIR`, `OCR_MIN_TRANSLATION_CONFIDENCE` — minimum combined quality score [0–1] to allow translation (default `0.65`).

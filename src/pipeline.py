@@ -17,7 +17,7 @@ from src.inpainting import Inpainter
 from src.models import OCRResult
 from src.ocr.postprocess import sort_manga_reading_order
 from src.renderer import Renderer, TextAnchorDetector
-from src.translator import OllamaCorrector, Translator
+from src.translator import Translator
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ class _PipelinePacket:
     item: Any
     original_image: Image.Image | None = None
     regions: list[OCRResult] = field(default_factory=list)
+    skipped_regions: list[OCRResult] = field(default_factory=list)
     inpainted_image: Image.Image | None = None
     translated_image: Image.Image | None = None
     error: PipelineError | None = None
@@ -49,11 +50,67 @@ class PipelineError(RuntimeError):
         self.error = error
 
 
+def _bboxes_overlap(first: tuple[int, int, int, int], second: tuple[int, int, int, int]) -> bool:
+    return max(first[0], second[0]) < min(first[2], second[2]) and max(first[1], second[1]) < min(first[3], second[3])
+
+
+def _restore_skipped_regions(
+    rendered_image: Image.Image,
+    original_image: Image.Image,
+    skipped_regions: list[OCRResult],
+    translatable_regions: list[OCRResult],
+) -> Image.Image:
+    """Restore original source text pixels for any OCR region skipped during translation.
+
+    Ensures that untranslated or low-confidence text is never left as a blank erased hole,
+    preserving the original Japanese text and artwork from the source manga image.
+    """
+    if not skipped_regions or original_image is None:
+        return rendered_image
+
+    result = rendered_image.copy()
+    w, h = result.size
+
+    for region in skipped_regions:
+        bbox = region.source_bbox or region.bbox
+        l, t, r, b = bbox
+        l, t = max(0, l), max(0, t)
+        r, b = min(w, r), min(h, b)
+        if r <= l or b <= t:
+            continue
+
+        orig_patch = original_image.crop((l, t, r, b))
+
+        has_overlap = any(
+            _bboxes_overlap((l, t, r, b), tr.source_bbox or tr.bbox)
+            for tr in translatable_regions
+        )
+
+        if not has_overlap:
+            result.paste(orig_patch, (l, t))
+        else:
+            if isinstance(region.ocr_mask, np.ndarray) and region.ocr_mask.shape[:2] == (b - t, r - l):
+                mask = Image.fromarray((region.ocr_mask.astype(np.uint8) * 255), mode="L")
+                result.paste(orig_patch, (l, t), mask)
+            else:
+                crop_arr = np.array(orig_patch.convert("RGB"))
+                gray = cv2.cvtColor(crop_arr, cv2.COLOR_RGB2GRAY)
+                p75 = float(np.percentile(gray, 75))
+                if p75 >= 128:
+                    ink = gray <= min(180, p75 - 25)
+                else:
+                    p25 = float(np.percentile(gray, 25))
+                    ink = gray >= max(100, p25 + 25)
+                mask = Image.fromarray((ink.astype(np.uint8) * 255), mode="L")
+                result.paste(orig_patch, (l, t), mask)
+
+    return result
+
+
 class MangaTranslationPipeline:
     def __init__(
         self,
         ocr: object,
-        corrector: OllamaCorrector,
         translator: Translator,
         inpainter: Inpainter,
         renderer: Renderer,
@@ -64,7 +121,6 @@ class MangaTranslationPipeline:
         ocr_weight_std: float = 0.80,
     ) -> None:
         self._ocr = ocr
-        self._corrector = corrector
         self._translator = translator
         self._inpainter = inpainter
         self._renderer = renderer
@@ -73,6 +129,10 @@ class MangaTranslationPipeline:
         self._ocr_weight_sentence = ocr_weight_sentence
         self._ocr_weight_mean = ocr_weight_mean
         self._ocr_weight_std = ocr_weight_std
+        self._last_page_context: str = ""
+
+    def reset_context(self) -> None:
+        self._last_page_context = ""
 
     def process_file(self, image_path: Path, cancel_event: Event | None = None) -> tuple[Image.Image, list[OCRResult]]:
         with Image.open(image_path) as source:
@@ -89,7 +149,11 @@ class MangaTranslationPipeline:
             raise PipelineError("OCR", error) from error
 
     def _run_translation(
-        self, image: Image.Image, regions: list[OCRResult], cancel_event: Event | None = None
+        self,
+        image: Image.Image,
+        regions: list[OCRResult],
+        cancel_event: Event | None = None,
+        context: str | None = None,
     ) -> tuple[list[OCRResult], bool]:
         _check_cancelled(cancel_event)
         valid_regions = _translation_candidates(
@@ -102,21 +166,10 @@ class MangaTranslationPipeline:
         if not valid_regions:
             return [], False
 
-        try:
-            _check_cancelled(cancel_event)
-            original_ocr_texts = [region.source_text for region in valid_regions]
-            corrections = self._corrector.correct(original_ocr_texts, valid_regions)
-            _check_cancelled(cancel_event)
-            for region, correction in zip(valid_regions, corrections, strict=True):
-                region.source_text = correction
-        except Exception as error:
-            raise PipelineError("correction", error) from error
-
         _check_cancelled(cancel_event)
         try:
-            translations = self._translator.translate(
-                [region.source_text for region in valid_regions], original_ocr_texts
-            )
+            texts = [region.source_text for region in valid_regions]
+            translations = self._translator.translate(texts, context=context)
             for region, translation in zip(valid_regions, translations, strict=True):
                 region.translated_text = translation
             return valid_regions, False
@@ -148,16 +201,28 @@ class MangaTranslationPipeline:
         except Exception as error:
             raise PipelineError("rendering", error) from error
 
-    def process(self, image: Image.Image, cancel_event: Event | None = None) -> tuple[Image.Image, list[OCRResult]]:
+    def process(
+        self,
+        image: Image.Image,
+        cancel_event: Event | None = None,
+        context: str | None = None,
+    ) -> tuple[Image.Image, list[OCRResult]]:
         regions = self._run_ocr(image, cancel_event)
-        translatable_regions, failed = self._run_translation(image, regions, cancel_event)
+        ctx = context if context is not None else self._last_page_context
+        translatable_regions, failed = self._run_translation(image, regions, cancel_event, context=ctx)
         if failed:
             return image, []
+        page_translations = [r.translated_text for r in translatable_regions if r.translated_text]
+        if page_translations:
+            self._last_page_context = "\n".join(page_translations)
         _check_cancelled(cancel_event)
         inpainted_image = self._run_inpaint(image, translatable_regions, cancel_event)
         _check_cancelled(cancel_event)
         rendered_image = self._run_render(inpainted_image, translatable_regions, cancel_event)
-        return rendered_image, translatable_regions
+        trans_ids = set(id(r) for r in translatable_regions)
+        skipped_regions = [r for r in regions if id(r) not in trans_ids]
+        final_image = _restore_skipped_regions(rendered_image, image, skipped_regions, translatable_regions)
+        return final_image, translatable_regions
 
     def process_pipelined(
         self,
@@ -190,6 +255,7 @@ class MangaTranslationPipeline:
             q_ocr_to_trans.put(None)
 
         def trans_worker() -> None:
+            prev_context: str = ""
             while True:
                 packet = q_ocr_to_trans.get()
                 if packet is None:
@@ -202,12 +268,24 @@ class MangaTranslationPipeline:
                     break
                 if packet.error is None and packet.original_image is not None:
                     try:
-                        translatable, failed = self._run_translation(packet.original_image, packet.regions, cancel_event)
+                        all_regions = packet.regions
+                        translatable, failed = self._run_translation(
+                            packet.original_image,
+                            all_regions,
+                            cancel_event,
+                            context=prev_context,
+                        )
                         if failed:
                             packet.regions = []
+                            packet.skipped_regions = all_regions
                             packet.translated_image = packet.original_image
                         else:
                             packet.regions = translatable
+                            trans_ids = set(id(r) for r in translatable)
+                            packet.skipped_regions = [r for r in all_regions if id(r) not in trans_ids]
+                            page_translations = [r.translated_text for r in translatable if r.translated_text]
+                            if page_translations:
+                                prev_context = "\n".join(page_translations)
                     except PipelineError as err:
                         packet.error = err
                     except Exception as err:
@@ -251,7 +329,13 @@ class MangaTranslationPipeline:
                     break
                 if packet.error is None and packet.inpainted_image is not None and packet.translated_image is None:
                     try:
-                        packet.translated_image = self._run_render(packet.inpainted_image, packet.regions, cancel_event)
+                        rendered = self._run_render(packet.inpainted_image, packet.regions, cancel_event)
+                        if packet.original_image is not None:
+                            packet.translated_image = _restore_skipped_regions(
+                                rendered, packet.original_image, packet.skipped_regions, packet.regions
+                            )
+                        else:
+                            packet.translated_image = rendered
                     except PipelineError as err:
                         packet.error = err
                     except Exception as err:
@@ -292,7 +376,7 @@ def _check_cancelled(cancel_event: Event | None) -> None:
         raise RuntimeError("Processing cancelled because the viewer was closed.")
 
 
-_PUNCTUATION_CHARS = frozenset("…‥・:：、。!?！？-〜ー—~\"'()（）[]「」『』〈〉《》")
+_PUNCTUATION_CHARS = frozenset("…‥・:：、。!?！？-〜ー—~\"'()（）[]「」『』〈〉《》.．")
 
 
 def _is_punctuation(ch: str) -> bool:
@@ -307,7 +391,7 @@ def compute_ocr_quality_score(
     weight_mean: float = 0.5,
     weight_std: float = 0.80,
     weight_low_conf: float = 0.25,
-    low_conf_threshold: float = 0.5,
+    low_conf_threshold: float = 0.70,
 ) -> float | None:
     """Compute combined OCR quality score.
 
@@ -341,6 +425,9 @@ def compute_ocr_quality_score(
         ]
         if content_confs:
             eval_confidences = content_confs
+        else:
+            # If all characters are punctuation (e.g. "．．．．" or "！？"), evaluate by sentence confidence directly
+            return float(sentence_confidence)
 
     if not eval_confidences:
         return float(sentence_confidence)

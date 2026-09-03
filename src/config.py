@@ -15,7 +15,6 @@ class Settings:
     source_language: str
     target_language: str
     translation_prompt_path: Path
-    correction_prompt_path: Path
     output_dir: Path
     output_format: str
     output_jpeg_quality: int
@@ -52,7 +51,6 @@ class Settings:
             source_language=_required_setting("SOURCE_LANGUAGE"),
             target_language=_required_setting("TARGET_LANGUAGE"),
             translation_prompt_path=_project_path(project_root, _required_setting("TRANSLATION_PROMPT_FILE")),
-            correction_prompt_path=_project_path(project_root, _required_setting("CORRECTION_PROMPT_FILE")),
             output_dir=_project_path(project_root, _required_setting("OUTPUT_DIR")),
             output_format=_required_setting("OUTPUT_FORMAT").lower(),
             output_jpeg_quality=int(_required_setting("OUTPUT_JPEG_QUALITY")),
@@ -66,7 +64,7 @@ class Settings:
             text_anchor_engine=_required_setting("TEXT_ANCHOR_ENGINE").lower(),
             ocr_engine=_optional_setting("OCR_ENGINE", "manga-ocr").lower(),
             ocr_model_dir=_project_path(project_root, _required_setting("OCR_MODEL_DIR")),
-            ocr_min_translation_confidence=_confidence_setting("OCR_MIN_TRANSLATION_CONFIDENCE", 0.65),
+            ocr_min_translation_confidence=_confidence_setting("OCR_MIN_TRANSLATION_CONFIDENCE", 0.25),
             pipeline_mode=_required_setting("PIPELINE_MODE").lower(),
             yolo_model_path=_project_path(project_root, _required_setting("YOLO_MODEL_PATH")),
             yolo_confidence=float(_required_setting("YOLO_CONFIDENCE")),

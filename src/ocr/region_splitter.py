@@ -26,64 +26,53 @@ def _mask_in_region(region: TextRegion) -> np.ndarray:
     return np.ones((bottom - top, right - left), dtype=bool)
 
 
-def _find_blank_bands(projection: np.ndarray, min_gap_length: int, low_threshold: int = 2) -> list[tuple[int, int]]:
-    """Find contiguous *interior* blank bands in a 1D projection profile.
+def _cluster_components(
+    components: list[tuple[int, int, int, int, int]],
+    max_gap_x: int,
+    max_gap_y: int,
+) -> list[list[int]]:
+    """Union-Find clustering of text components based on bounding box proximity.
 
-    A band is interior when it does not start at index 0 (i.e. there is ink on
-    both sides), ensuring we never split at the very edge of a region.
-    Trailing blank runs at the end of the projection are also ignored because
-    the loop exits without a flush step.
+    Two components belong to the same text group if their horizontal gap is
+    <= max_gap_x and their vertical gap is <= max_gap_y. This groups characters
+    in the same column/line and adjacent columns/lines within a single paragraph.
     """
-    bands: list[tuple[int, int]] = []
-    start: int | None = None
-    for idx, count in enumerate(projection):
-        is_blank = count <= low_threshold
-        if is_blank and start is None:
-            start = idx
-        elif not is_blank and start is not None:
-            if start > 0 and (idx - start) >= min_gap_length:
-                bands.append((start, idx))
-            start = None
-    return bands
+    n = len(components)
+    parent = list(range(n))
 
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
 
-def _valid_split_points(bands: list[tuple[int, int]], total: int, min_sub_size: int) -> list[int]:
-    """Return midpoints of *bands* such that every resulting sub-segment is at
-    least *min_sub_size* pixels wide.
+    def union(i: int, j: int) -> None:
+        pi, pj = find(i), find(j)
+        if pi != pj:
+            parent[pj] = pi
 
-    Bands are processed left-to-right; a candidate midpoint is kept only when
-    the segment before it (since the last accepted point) is large enough.
-    A final pass drops the last accepted point if it would leave a trailing
-    segment that is too short.
-    """
-    valid = [
-        (start, end)
-        for start, end in bands
-        if start >= min_sub_size and total - end >= min_sub_size
-    ]
+    for i in range(n):
+        li, ti, ri, bi, _ = components[i]
+        for j in range(i + 1, n):
+            lj, tj, rj, bj, _ = components[j]
+            gap_x = max(0, max(li, lj) - min(ri, rj))
+            gap_y = max(0, max(ti, tj) - min(bi, bj))
+            if gap_x <= max_gap_x and gap_y <= max_gap_y:
+                union(i, j)
 
-    if not valid:
-        return []
-
-    start, end = max(valid, key=lambda band: band[1] - band[0])
-    return [(start + end) // 2]
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        root = find(i)
+        groups.setdefault(root, []).append(i)
+    return list(groups.values())
 
 
 def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.ndarray | None = None) -> list[TextRegion]:
-    """Projection-profile based region splitter.
+    """Cluster-based region splitter.
 
     Splits only when clear large interior blank gaps exist between distinct
-    speech bubbles or paragraphs.
-
-    Strategy
-    --------
-    1. Attempt a Y-axis (horizontal) split using row-ink projection.
-    2. For every Y sub-region, independently attempt an X-axis (vertical)
-       split using column-ink projection.
-
-    This replaces the old mutual-exclusion (``elif``) logic, allowing a wide
-    region that contains e.g. two bubble rows – each with side-by-side bubbles –
-    to be correctly segmented on both axes.
+    speech bubbles or paragraphs, while strictly preserving multi-column vertical
+    and multi-line horizontal paragraphs belonging to the same text block.
     """
     left, top, right, bottom = region.bbox
     h_region, w_region = bottom - top, right - left
@@ -98,77 +87,123 @@ def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.n
     _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     ink = np.where(bubble_mask, ink, 0).astype(np.uint8)
 
-    # Estimate median glyph dimensions via connected components.
     n_labels, _, stats, _ = cv2.connectedComponentsWithStats(ink)
     components = [
-        (l, t, l + w, t + h)
-        for l, t, w, h, area in stats[1:n_labels]
-        if area >= 4 and w >= 3 and h >= 3
+        (int(stats[i, cv2.CC_STAT_LEFT]),
+         int(stats[i, cv2.CC_STAT_TOP]),
+         int(stats[i, cv2.CC_STAT_LEFT] + stats[i, cv2.CC_STAT_WIDTH]),
+         int(stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT]),
+         int(stats[i, cv2.CC_STAT_AREA]))
+        for i in range(1, n_labels)
+        if stats[i, cv2.CC_STAT_AREA] >= 4
+        and stats[i, cv2.CC_STAT_WIDTH] >= 3
+        and stats[i, cv2.CC_STAT_HEIGHT] >= 3
     ]
     if len(components) < 2:
         return [region]
 
-    widths = [r - l for l, t, r, b in components if (r - l) >= 6 and (b - t) >= 6]
-    heights = [b - t for l, t, r, b in components if (r - l) >= 6 and (b - t) >= 6]
+    widths = [r - l for l, t, r, b, _ in components if (r - l) >= 6 and (b - t) >= 6]
+    heights = [b - t for l, t, r, b, _ in components if (r - l) >= 6 and (b - t) >= 6]
     median_w = float(np.median(widths)) if widths else 30.0
     median_h = float(np.median(heights)) if heights else 30.0
 
-    # Vertical-bubble protection: a narrow region contains vertical text
-    # columns placed side-by-side.  Splitting along Y would chop staggered
-    # columns apart.  The threshold scales with actual median glyph width,
-    # replacing the old resolution-dependent 150 px hard-code.
-    if w_region <= round(median_w * 2.5):
+    # Conservative grouping: connect glyphs within normal paragraph / bubble spacing
+    max_gap_x = max(28, round(median_w * 2.2))
+    max_gap_y = max(28, round(median_h * 2.0))
+
+    cluster_indices = _cluster_components(components, max_gap_x, max_gap_y)
+
+    min_cluster_area = max(14, round(median_w * median_h * 0.25))
+    valid_clusters: list[tuple[int, int, int, int]] = []
+    for c_idxs in cluster_indices:
+        total_area = sum(components[i][4] for i in c_idxs)
+        has_substantial_glyph = any(
+            (components[i][2] - components[i][0]) >= 6 and (components[i][3] - components[i][1]) >= 6
+            for i in c_idxs
+        )
+        if len(c_idxs) >= 2 or (total_area >= min_cluster_area and has_substantial_glyph):
+            cl = min(components[i][0] for i in c_idxs)
+            ct = min(components[i][1] for i in c_idxs)
+            cr = max(components[i][2] for i in c_idxs)
+            cb = max(components[i][3] for i in c_idxs)
+            valid_clusters.append((cl, ct, cr, cb))
+
+    if len(valid_clusters) <= 1:
+        # All ink belongs to a single connected paragraph / speech bubble
         return [region]
 
-    min_y_gap = max(30, round(median_h * 0.7))
-    min_x_gap = max(30, round(median_w * 1.2))
+    min_y_gap = max(30, round(median_h * 1.5))
+    min_x_gap = max(30, round(median_w * 1.5))
     min_sub_h = max(35, round(median_h * 1.6))
     min_sub_w = max(35, round(median_w * 1.6))
 
-    low_thresh_y = max(5, round(w_region * 0.05))
+    def split_axis(
+        clusters: list[tuple[int, int, int, int]],
+        axis: int,  # 1 for Y, 0 for X
+        total_size: int,
+        min_gap: int,
+        min_sub_size: int,
+    ) -> list[int]:
+        if axis == 1:
+            sorted_c = sorted(clusters, key=lambda c: (c[1], c[3]))
+            start_coord, end_coord = 1, 3
+        else:
+            sorted_c = sorted(clusters, key=lambda c: (c[0], c[2]))
+            start_coord, end_coord = 0, 2
 
-    row_sums = (ink > 0).sum(axis=1)
-    y_pts_local = _valid_split_points(
-        _find_blank_bands(row_sums, min_gap_length=min_y_gap, low_threshold=low_thresh_y),
-        h_region,
-        min_sub_h,
-    )
+        split_pts: list[int] = []
+        max_prev_end = sorted_c[0][end_coord]
+        last_pt = 0
 
-    # Build Y sub-regions together with their region-local ink slices.
-    if y_pts_local:
-        y_abs_bounds = [top] + [top + pt for pt in y_pts_local] + [bottom]
-        y_parts: list[tuple[TextRegion, np.ndarray]] = []
-        for i in range(len(y_abs_bounds) - 1):
-            sub_box = (left, y_abs_bounds[i], right, y_abs_bounds[i + 1])
-            lt, lb = y_abs_bounds[i] - top, y_abs_bounds[i + 1] - top
-            sub_ink = ink[lt:lb, :]
+        for i in range(len(sorted_c) - 1):
+            max_prev_end = max(max_prev_end, sorted_c[i][end_coord])
+            next_start = min(c[start_coord] for c in sorted_c[i + 1:])
+            gap = next_start - max_prev_end
+            if gap >= min_gap:
+                pt = (max_prev_end + next_start) // 2
+                if pt - last_pt >= min_sub_size and total_size - pt >= min_sub_size:
+                    split_pts.append(pt)
+                    last_pt = pt
+
+        return split_pts
+
+    # 1. Attempt Y split
+    y_pts = split_axis(valid_clusters, axis=1, total_size=h_region, min_gap=min_y_gap, min_sub_size=min_sub_h)
+    if y_pts:
+        y_bounds = [0] + y_pts + [h_region]
+        y_parts: list[tuple[TextRegion, np.ndarray, list[tuple[int, int, int, int]]]] = []
+        for i in range(len(y_bounds) - 1):
+            y0, y1 = y_bounds[i], y_bounds[i + 1]
+            sub_box = (left, top + y0, right, top + y1)
+            sub_ink = ink[y0:y1, :]
+            sub_clusters = [
+                (cl, ct - y0, cr, cb - y0)
+                for cl, ct, cr, cb in valid_clusters
+                if ct < y1 and cb > y0
+            ]
             y_parts.append((
                 replace(region, bbox=sub_box, source_bbox=sub_box, ocr_mask=sub_ink.astype(bool)),
                 sub_ink,
+                sub_clusters,
             ))
     else:
-        y_parts = [(region, ink)]
+        y_parts = [(region, ink, valid_clusters)]
 
-    # For each Y part, independently attempt an X-axis split.
+    # 2. For each Y sub-region, independently attempt an X-axis split if multiple clusters exist
     result: list[TextRegion] = []
-    for y_sub, y_ink in y_parts:
+    for y_sub, y_ink, sub_c in y_parts:
+        if len(sub_c) <= 1:
+            result.append(y_sub)
+            continue
         ys_left, ys_top, ys_right, ys_bottom = y_sub.bbox
-        ys_h = ys_bottom - ys_top
-
-        low_thresh_x = max(5, round(ys_h * 0.05))
-        col_sums = (y_ink > 0).sum(axis=0)
-        x_pts_local = _valid_split_points(
-            _find_blank_bands(col_sums, min_gap_length=min_x_gap, low_threshold=low_thresh_x),
-            ys_right - ys_left,
-            min_sub_w,
-        )
-
-        if x_pts_local:
-            x_abs_bounds = [ys_left] + [ys_left + pt for pt in x_pts_local] + [ys_right]
-            for i in range(len(x_abs_bounds) - 1):
-                sub_box = (x_abs_bounds[i], ys_top, x_abs_bounds[i + 1], ys_bottom)
-                ll, lr = x_abs_bounds[i] - ys_left, x_abs_bounds[i + 1] - ys_left
-                result.append(replace(y_sub, bbox=sub_box, source_bbox=sub_box, ocr_mask=y_ink[:, ll:lr].astype(bool)))
+        ys_w = ys_right - ys_left
+        x_pts = split_axis(sub_c, axis=0, total_size=ys_w, min_gap=min_x_gap, min_sub_size=min_sub_w)
+        if x_pts:
+            x_bounds = [0] + x_pts + [ys_w]
+            for i in range(len(x_bounds) - 1):
+                x0, x1 = x_bounds[i], x_bounds[i + 1]
+                sub_box = (ys_left + x0, ys_top, ys_left + x1, ys_bottom)
+                result.append(replace(y_sub, bbox=sub_box, source_bbox=sub_box, ocr_mask=y_ink[:, x0:x1].astype(bool)))
         else:
             result.append(y_sub)
 

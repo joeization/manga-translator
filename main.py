@@ -25,7 +25,7 @@ from src.inpainting import NoopInpainter, OpenCVInpainter
 from src.ocr import BaberuOCR, HybridTextBubbleDetector, MangaOCR, Manga109BubbleSegmenter, Manga109YoloTextDetector
 from src.pipeline import MangaTranslationPipeline, PipelineError, draw_debug_image, save_debug_image
 from src.renderer import MaskAwarePillowRenderer, OpenCVInkAnchorDetector, PillowRenderer
-from src.translator import OllamaCorrector, OllamaTranslator
+from src.translator import OllamaTranslator
 from src.viewer import ImageViewer
 
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
@@ -337,13 +337,6 @@ def main() -> int:
 
         settings = Settings.load(project_root)
         ollama_session = requests.Session()
-        corrector = OllamaCorrector(
-            settings.ollama_host,
-            settings.ollama_model,
-            settings.source_language,
-            settings.correction_prompt_path,
-            session=ollama_session,
-        )
         translator = OllamaTranslator(
             settings.ollama_host,
             settings.ollama_model,
@@ -354,7 +347,6 @@ def main() -> int:
         )
         pipeline = MangaTranslationPipeline(
             build_ocr(settings),
-            corrector,
             translator,
             build_inpainter(settings),
             build_renderer(settings),
