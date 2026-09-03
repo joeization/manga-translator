@@ -16,7 +16,7 @@ from PIL import Image
 from src.models import TextRegion
 
 from .base import Inpainter
-from .utils import estimate_ink_color
+from .utils import estimate_adaptive_dilation, estimate_ink_color
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +31,12 @@ except ImportError:
 class LamaInpainter(Inpainter):
     """LaMa Manga neural inpainting using ONNX Runtime (GPU CUDA)."""
 
-    def __init__(self, model_path: Path | None = None, device: str = "gpu") -> None:
+    def __init__(self, model_path: Path | None = None, device: str = "gpu", mask_dilation: int = 3) -> None:
         if not _ONNX_AVAILABLE:
             raise ImportError("onnxruntime package is required. Install via 'pip install onnxruntime-gpu'.")
 
         self._device = device.lower()
+        self._mask_dilation = max(3, mask_dilation)
         self._model_path = self._resolve_model_path(model_path)
         logger.info("Initializing LaMa Manga ONNX model on GPU from: %s", self._model_path)
 
@@ -101,8 +102,10 @@ class LamaInpainter(Inpainter):
         full_mask = np.zeros((h, w), dtype=np.uint8)
         valid_bboxes: list[tuple[int, int, int, int]] = []
         for region in regions:
-            mask, bbox = _extract_text_glyph_mask(img_rgb, region, h, w)
+            mask, bbox = _extract_text_glyph_mask(img_rgb, region, h, w, mask_dilation=self._mask_dilation)
             if mask is not None and bbox is not None:
+                region.inpaint_bbox = bbox
+                region.inpaint_mask = mask
                 valid_bboxes.append(bbox)
                 rl, rt, rr, rb = bbox
                 mask_uint8 = mask.astype(np.uint8) * 255
@@ -120,6 +123,7 @@ class LamaInpainter(Inpainter):
 
         # Cluster nearby bboxes for high-resolution ROI patch inpainting
         roi_clusters = _cluster_bboxes(valid_bboxes, margin=48, img_w=w, img_h=h)
+        logger.info("LaMa: running neural inpainting on %d regions across %d ROI clusters", len(valid_bboxes), len(roi_clusters))
 
         output_pixels = img_rgb.copy()
         for crop_l, crop_t, crop_r, crop_b in roi_clusters:
@@ -169,65 +173,130 @@ class LamaInpainter(Inpainter):
         return cv2.resize(out_uint8, (patch_w, patch_h), interpolation=cv2.INTER_CUBIC)
 
 
+def _bubble_mask_in_region(
+    roi_bbox: tuple[int, int, int, int],
+    bubble_bbox: tuple[int, int, int, int],
+    bubble_mask: np.ndarray,
+) -> np.ndarray:
+    rl, rt, rr, rb = roi_bbox
+    bl, bt, br, bb = bubble_bbox
+    result = np.zeros((rb - rt, rr - rl), dtype=bool)
+
+    ol, ot = max(rl, bl), max(rt, bt)
+    or_, ob = min(rr, br), min(rb, bb)
+    if or_ <= ol or ob <= ot:
+        return result
+
+    st, sl = ot - bt, ol - bl
+    sb, sr = ob - bt, or_ - bl
+    tt, tl = ot - rt, ol - rl
+    tb, tr = ob - rt, or_ - rl
+
+    src = bubble_mask[st:sb, sl:sr]
+    h = min(src.shape[0], tb - tt)
+    w = min(src.shape[1], tr - tl)
+    result[tt : tt + h, tl : tl + w] = src[:h, :w]
+    return result
+
+
 def _extract_text_glyph_mask(
     img_rgb: np.ndarray,
     region: TextRegion,
     img_h: int,
     img_w: int,
+    mask_dilation: int = 1,
 ) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None]:
-    """Extract precise text glyph mask from original image patch."""
+    """Extract precise text glyph mask, expanding to swallow outlines and clipped to bubble segmentation."""
     bbox = region.inpaint_bbox or region.source_bbox or region.bbox
     rl, rt, rr, rb = bbox
-    rl, rt = max(0, rl), max(0, rt)
-    rr, rb = min(img_w, rr), min(img_h, rb)
-    if rr <= rl or rb <= rt:
+
+    # Dynamically estimate adaptive dilation from detect box, character count, and image resolution
+    adaptive_dilation = estimate_adaptive_dilation(
+        region.bbox,
+        region.source_text,
+        img_w,
+        img_h,
+        base_dilation=mask_dilation,
+    )
+    pad = max(6, adaptive_dilation + 2)
+
+    pl, pt = max(0, rl - pad), max(0, rt - pad)
+    pr, pb = min(img_w, rr + pad), min(img_h, rb + pad)
+    if pr <= pl or pb <= pt:
         return None, None
 
-    roi = img_rgb[rt:rb, rl:rr]
+    roi = img_rgb[pt:pb, pl:pr]
     if roi.size == 0:
         return None, None
 
+    # Compute bubble segmentation mask in ROI local coordinates if available
+    seg_mask: np.ndarray | None = None
+    if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
+        seg_mask = _bubble_mask_in_region((pl, pt, pr, pb), region.layout_bbox, region.layout_mask)
+
     # 1. Prioritize explicit ocr_mask or inpaint_mask if available
-    if isinstance(region.ocr_mask, np.ndarray) and region.ocr_mask.shape[:2] == roi.shape[:2]:
-        mask = region.ocr_mask.astype(bool)
-        if mask.ndim == 3:
-            mask = np.any(mask, axis=2)
-        if np.any(mask):
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-            dilated = cv2.dilate(mask.astype(np.uint8), kernel, iterations=2).astype(bool)
-            return dilated, (rl, rt, rr, rb)
+    for mask_source in (region.ocr_mask, region.inpaint_mask):
+        if isinstance(mask_source, np.ndarray) and mask_source.shape[:2] == roi.shape[:2]:
+            mask = mask_source.astype(bool)
+            if mask.ndim == 3:
+                mask = np.any(mask, axis=2)
+            if np.any(mask):
+                ks = adaptive_dilation * 2 + 1
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+                dilated = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+                if seg_mask is not None and np.any(seg_mask):
+                    dilated = dilated & seg_mask
+                return dilated, (pl, pt, pr, pb)
 
-    if isinstance(region.inpaint_mask, np.ndarray) and region.inpaint_mask.shape[:2] == roi.shape[:2]:
-        mask = region.inpaint_mask.astype(bool)
-        if np.any(mask):
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-            dilated = cv2.dilate(mask.astype(np.uint8), kernel, iterations=2).astype(bool)
-            return dilated, (rl, rt, rr, rb)
-
-    # 2. Extract text glyph strokes via local contrast & luminance thresholding
+    # 2. Extract text glyph strokes and stroke outlines (描邊 / 袋文字)
     gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    p75 = float(np.percentile(gray, 75))
 
-    edge_mask = np.ones(roi.shape[:2], dtype=bool)
-    if roi.shape[0] > 6 and roi.shape[1] > 6:
-        edge_mask[3:-3, 3:-3] = False
-    bg_color = np.median(roi[edge_mask], axis=0) if np.any(edge_mask) else np.median(roi.reshape(-1, 3), axis=0)
-    bg_luma = float(0.299 * bg_color[0] + 0.587 * bg_color[1] + 0.114 * bg_color[2])
-
+    # Detect stroke outlines (描邊) via local color deviation from surrounding background
+    bg_color = np.median(roi, axis=(0, 1))
     color_dist = np.linalg.norm(roi.astype(float) - bg_color, axis=2)
+    outline_mask = color_dist >= 25.0
 
-    if bg_luma >= 128:
-        glyph_mask = (gray <= 170) | (color_dist >= 30.0)
-    else:
-        glyph_mask = (gray >= 110) | (color_dist >= 30.0)
+    # Dark text or text with outlines on light background (standard manga)
+    if p75 >= 128:
+        glyph_mask = (gray <= min(190, p75 - 25)) | outline_mask
+    else:  # Light text on dark background
+        p25 = float(np.percentile(gray, 25))
+        glyph_mask = (gray >= max(100, p25 + 25)) | outline_mask
 
-    glyph_uint8 = glyph_mask.astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    dilated_glyph = cv2.dilate(glyph_uint8, kernel, iterations=2) > 0
+    # Dilate glyph mask using actual measured glyph font size and stroke width to swallow text outlines (描邊)
+    actual_dilation = estimate_adaptive_dilation(
+        region.bbox,
+        region.source_text,
+        img_w,
+        img_h,
+        base_dilation=mask_dilation,
+        glyph_mask=glyph_mask,
+    )
+    ks = actual_dilation * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+    dilated_glyph = cv2.dilate(glyph_mask.astype(np.uint8), kernel, iterations=1) > 0
+
+    # Crucial: Intersect with bubble segmentation mask so inpainting never exceeds the bubble boundary
+    if seg_mask is not None and np.any(seg_mask):
+        dilated_glyph = dilated_glyph & seg_mask
 
     if np.any(dilated_glyph):
-        return dilated_glyph, (rl, rt, rr, rb)
+        return dilated_glyph, (pl, pt, pr, pb)
 
-    return np.ones((rb - rt, rr - rl), dtype=bool), (rl, rt, rr, rb)
+    # Fallback for detect box: intersect detect box with segmentation mask (never use raw unclipped rect)
+    if seg_mask is not None and np.any(seg_mask):
+        detect_rect = np.zeros(roi.shape[:2], dtype=bool)
+        dt = max(0, rt - pt)
+        db = min(pb - pt, rb - pt)
+        dl = max(0, rl - pl)
+        dr = min(pr - pl, rr - pl)
+        detect_rect[dt:db, dl:dr] = True
+        clipped_mask = detect_rect & seg_mask
+        if np.any(clipped_mask):
+            return clipped_mask, (pl, pt, pr, pb)
+
+    return None, None
 
 
 def _cluster_bboxes(

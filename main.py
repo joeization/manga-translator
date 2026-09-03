@@ -30,6 +30,7 @@ from src.viewer import ImageViewer
 
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 DETAIL_LOGGERS = ("src.ocr.mangaocr", "src.ocr.baberuocr", "src.translator.ollama")
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -129,8 +130,14 @@ def parse_arguments() -> argparse.Namespace:
 
 def build_inpainter(settings: Settings):
     if not settings.inpaint_enabled or settings.inpaint_engine == "none":
+        logger.info("Inpainting disabled (engine=%s, enabled=%s)", settings.inpaint_engine, settings.inpaint_enabled)
         return NoopInpainter()
     if settings.inpaint_engine == "opencv":
+        logger.info(
+            "Using inpainting engine: opencv (algorithm=%s, mode=%s)",
+            settings.inpaint_algorithm,
+            settings.bubble_clear_mode,
+        )
         return OpenCVInpainter(
             settings.text_dark_threshold,
             settings.white_background_threshold,
@@ -148,12 +155,13 @@ def build_inpainter(settings: Settings):
             settings.inpaint_algorithm,
         )
     if settings.inpaint_engine == "lama":
+        logger.info("Using inpainting engine: lama (device=%s, model=%s)", settings.lama_device, settings.lama_model_path)
         from src.inpainting import LamaInpainter
 
         lama_path = settings.lama_model_path
         if lama_path is None:
             raise RuntimeError("LAMA_MODEL_PATH must be set when INPAINT_ENGINE=lama")
-        return LamaInpainter(lama_path, settings.lama_device)
+        return LamaInpainter(lama_path, settings.lama_device, mask_dilation=settings.mask_dilation)
     raise RuntimeError(f"Unsupported INPAINT_ENGINE: {settings.inpaint_engine}")
 
 

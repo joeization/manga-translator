@@ -1,6 +1,4 @@
 """
-OpenCV-based text-removal inpainter.
-
 Processing flow per region
 --------------------------
 1. Locate the surrounding speech bubble via three fallback strategies:
@@ -32,7 +30,8 @@ from src.models import TextRegion
 
 from .base import Inpainter
 from .bubble import OpenCVContourBubbleSegmenter
-# Minimum background sample size before we trust the colour estimate.
+from .utils import estimate_adaptive_dilation
+# Minimum background sample size before we trust the colour estimate.
 _MIN_BG_SAMPLES: int = 16
 # Hard floor on the colour-distance contrast threshold.
 _MIN_CONTRAST: float = 20.0
@@ -131,11 +130,7 @@ class OpenCVInpainter(Inpainter):
         use_interior_clear = (
             self._bubble_clear_mode == "interior"
             and bubble is not None
-            and self._is_plain_white_region(
-                roi,
-                bubble_mask_roi,
-                require_enclosed_shape=bubble_source != "existing",
-            )
+            and self._is_plain_white_region(roi, bubble_mask_roi)
         )
 
         if use_interior_clear:
@@ -144,10 +139,20 @@ class OpenCVInpainter(Inpainter):
             target_std = np.std(target_pixels.astype(float), axis=0) if len(target_pixels) > 0 else bg_std
             is_uniform = float(np.max(target_std)) < min(2.0, self._solid_fill_std_threshold)
         else:
-            fill_mask = self._glyph_fill_mask(region, roi_bbox, roi, allowed, bg_color, bg_std)
+            fill_mask = self._glyph_fill_mask(
+                region,
+                roi_bbox,
+                roi,
+                allowed,
+                bg_color,
+                bg_std,
+                img_w=pixels.shape[1],
+                img_h=pixels.shape[0],
+            )
             # Evaluate std on non-text background pixels within allowed target area
             bg_pixels = roi[allowed & ~fill_mask]
             if len(bg_pixels) >= _MIN_BG_SAMPLES:
+                bg_color = np.median(bg_pixels, axis=0)
                 target_std = np.std(bg_pixels.astype(float), axis=0)
             elif np.any(allowed):
                 target_std = np.std(roi[allowed].astype(float), axis=0)
@@ -174,9 +179,9 @@ class OpenCVInpainter(Inpainter):
             return
 
         fill_color = np.clip(np.round(bg_color), 0, 255).astype(np.uint8)
-        # Use flat single-color fill ONLY for interior clear on pure uniform white bubbles.
-        # For text glyph inpainting on any background, ALWAYS use dynamic spatial cv2.inpaint.
-        if use_interior_clear and is_uniform:
+        # If background is uniform, fill glyphs/interior directly with the true background color.
+        # Otherwise, use spatial inpainting to interpolate gradient or textured background.
+        if is_uniform:
             result = roi.copy()
             result[fill_mask] = fill_color
             pixels[top:bottom, left:right] = result
@@ -245,23 +250,25 @@ class OpenCVInpainter(Inpainter):
         self,
         roi: np.ndarray,
         allowed: np.ndarray,
-        require_enclosed_shape: bool,
     ) -> bool:
-        if not np.any(allowed):
-            return False
-        if require_enclosed_shape and not _looks_like_enclosed_bubble_mask(allowed):
+        if not np.any(allowed) or not _looks_like_enclosed_bubble_mask(allowed):
             return False
 
         gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
         allowed_gray = gray[allowed]
-        white_ratio = float(np.count_nonzero(allowed_gray >= self._white_threshold) / len(allowed_gray))
-        if white_ratio < self._white_ratio:
+
+        # Evaluate non-text background pixels within the bubble region
+        bg_gray = allowed_gray[allowed_gray >= self._dark_threshold]
+        if len(bg_gray) < _MIN_BG_SAMPLES:
             return False
 
-        white_pixels = roi[allowed & (gray >= self._white_threshold)]
-        if len(white_pixels) < _MIN_BG_SAMPLES:
+        # Must be overwhelmingly clean white (at least 90% of non-text background >= white_threshold)
+        white_count = int(np.count_nonzero(bg_gray >= self._white_threshold))
+        if white_count / len(bg_gray) < max(0.90, self._white_ratio):
             return False
-        return float(np.max(np.std(white_pixels.astype(float), axis=0))) < self._solid_fill_std_threshold
+
+        # Background variation must be uniform (std < 10 to reject textures/screentones/lines)
+        return float(np.std(bg_gray.astype(float))) < min(10.0, self._solid_fill_std_threshold)
 
     def _glyph_fill_mask(
         self,
@@ -271,23 +278,31 @@ class OpenCVInpainter(Inpainter):
         allowed: np.ndarray,
         bg_color: np.ndarray,
         bg_std: np.ndarray,
+        img_w: int = 1600,
+        img_h: int = 1600,
     ) -> np.ndarray:
+        adaptive_dilation = estimate_adaptive_dilation(
+            region.bbox,
+            region.source_text,
+            img_w,
+            img_h,
+            base_dilation=self._mask_dilation,
+        )
         ocr_mask = _ocr_mask_in_roi(region, roi_bbox, roi.shape[:2])
         if ocr_mask is not None and np.any(ocr_mask):
             mask = ocr_mask & allowed
-            return self._dilate_glyph_mask(mask, allowed, minimum=2, close=True)
+            return self._dilate_glyph_mask(mask, allowed, dilation=adaptive_dilation, close=True)
         detect_offset = _detect_offset_in_roi(region.bbox, roi_bbox)
-        return self._glyph_mask(roi, allowed, detect_offset, bg_color, bg_std)
+        return self._glyph_mask(roi, allowed, detect_offset, bg_color, bg_std, dilation=adaptive_dilation)
 
     def _dilate_glyph_mask(
         self,
         mask: np.ndarray,
         allowed: np.ndarray,
-        minimum: int = 1,
+        dilation: int = 2,
         close: bool = False,
     ) -> np.ndarray:
-        dilation = max(minimum, self._mask_dilation)
-        ks = dilation * 2 + 1
+        ks = max(1, dilation) * 2 + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
         prepared = cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
         if close:
@@ -301,6 +316,7 @@ class OpenCVInpainter(Inpainter):
         detect_offset: tuple[int, int, int, int],
         bg_color: np.ndarray,
         bg_std: np.ndarray,
+        dilation: int = 2,
     ) -> np.ndarray:
         """Detect text glyphs as pixels that deviate from the estimated background."""
         gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
@@ -324,7 +340,7 @@ class OpenCVInpainter(Inpainter):
         if not np.any(candidate):
             return np.zeros(roi.shape[:2], dtype=bool)
 
-        return self._dilate_glyph_mask(candidate, allowed)
+        return self._dilate_glyph_mask(candidate, allowed, dilation=dilation)
 
     def _find_bubble(
         self, pixels: np.ndarray, region: TextRegion
