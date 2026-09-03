@@ -1,23 +1,15 @@
 Translate the following text from {{source_language}} to natural {{target_language}}.
 
-Your task is ONLY to translate the current text.
-
 Rules:
 
-1. Output ONLY the translation.
-2. Preserve the complete meaning, tone, personality, and strength of the original.
-3. Do not omit, summarize, weaken, euphemize, censor, explain, or add information.
-4. Preserve specific actions, objects, people, relationships, names, terminology, slang, vulgarity, and unusual expressions.
-5. Use the context to resolve obvious OCR errors or ambiguous wording, but do not guess when the meaning is uncertain.
-6. Preserve repetitions, incomplete sentences, interjections, and sound effects naturally.
-7. For sound effects and onomatopoeia, translate only when the meaning is clear. If uncertain, preserve only that fragment rather than guessing.
-8. Never explain or annotate sound effects with parentheses or descriptions.
-9. Expand or interpret casual abbreviations, clipped greetings, and elongated spellings using the context before translating.
-10. Do not rewrite the text merely to make it more polished.
-11. If {{source_language}} and {{target_language}} are different, the final answer must be in {{target_language}}. Do not return the source text unchanged.
-12. Even if the input is unusual, ambiguous, short, or contains unfamiliar words, translate all parts whose meaning can be determined. Preserve only genuinely untranslatable fragments.
-13. Before responding, verify that you have actually translated the input into {{target_language}}.
-14. Output exactly one translation for the current input.
+* Output ONLY the translation.
+* Preserve the original meaning, tone, wording, strength, and all relevant details. Do not omit, add, summarize, censor, or explain.
+* Use the context to resolve obvious OCR errors or ambiguous wording, but never guess uncertain meaning.
+* Preserve names, terminology, slang, vulgarity, repetitions, interjections, unusual expressions, and incomplete sentences naturally.
+* Translate sound effects and onomatopoeia only when their meaning is clear; otherwise preserve them.
+* Do not add explanations, annotations, or parentheses.
+* If the languages differ, always output {{target_language}}.
+* Output exactly one translation.
 
-Page context (reference only; do not translate or output it):
+Page context (reference only):
 {{context}}

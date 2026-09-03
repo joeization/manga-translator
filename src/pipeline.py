@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,7 +49,19 @@ class PipelineError(RuntimeError):
 
 
 class MangaTranslationPipeline:
-    def __init__(self, ocr: object, corrector: OllamaCorrector, translator: Translator, inpainter: Inpainter, renderer: Renderer, anchor_detector: TextAnchorDetector, minimum_ocr_translation_confidence: float = 0.5) -> None:
+    def __init__(
+        self,
+        ocr: object,
+        corrector: OllamaCorrector,
+        translator: Translator,
+        inpainter: Inpainter,
+        renderer: Renderer,
+        anchor_detector: TextAnchorDetector,
+        minimum_ocr_translation_confidence: float = 0.75,
+        ocr_weight_sentence: float = 0.5,
+        ocr_weight_mean: float = 0.5,
+        ocr_weight_std: float = 0.80,
+    ) -> None:
         self._ocr = ocr
         self._corrector = corrector
         self._translator = translator
@@ -56,6 +69,9 @@ class MangaTranslationPipeline:
         self._renderer = renderer
         self._anchor_detector = anchor_detector
         self._minimum_ocr_translation_confidence = minimum_ocr_translation_confidence
+        self._ocr_weight_sentence = ocr_weight_sentence
+        self._ocr_weight_mean = ocr_weight_mean
+        self._ocr_weight_std = ocr_weight_std
 
     def process_file(self, image_path: Path, cancel_event: Event | None = None) -> tuple[Image.Image, list[OCRResult]]:
         with Image.open(image_path) as source:
@@ -74,31 +90,35 @@ class MangaTranslationPipeline:
     def _run_translation(
         self, image: Image.Image, regions: list[OCRResult], cancel_event: Event | None = None
     ) -> tuple[list[OCRResult], bool]:
+        _check_cancelled(cancel_event)
+        valid_regions = _translation_candidates(
+            regions,
+            minimum_confidence=self._minimum_ocr_translation_confidence,
+            weight_sentence=self._ocr_weight_sentence,
+            weight_mean=self._ocr_weight_mean,
+            weight_std=self._ocr_weight_std,
+        )
+        if not valid_regions:
+            return [], False
+
         try:
             _check_cancelled(cancel_event)
-            original_ocr_texts = [region.source_text for region in regions]
-            corrections = self._corrector.correct(original_ocr_texts, regions)
+            original_ocr_texts = [region.source_text for region in valid_regions]
+            corrections = self._corrector.correct(original_ocr_texts, valid_regions)
             _check_cancelled(cancel_event)
-            for region, correction in zip(regions, corrections, strict=True):
+            for region, correction in zip(valid_regions, corrections, strict=True):
                 region.source_text = correction
         except Exception as error:
             raise PipelineError("correction", error) from error
 
         _check_cancelled(cancel_event)
         try:
-            translatable_regions = _translation_candidates(regions, self._minimum_ocr_translation_confidence)
-            translatable_region_ids = {id(region) for region in translatable_regions}
-            translatable_original_texts = [
-                original_ocr_texts[index]
-                for index, region in enumerate(regions)
-                if id(region) in translatable_region_ids
-            ]
             translations = self._translator.translate(
-                [region.source_text for region in translatable_regions], translatable_original_texts
+                [region.source_text for region in valid_regions], original_ocr_texts
             )
-            for region, translation in zip(translatable_regions, translations, strict=True):
+            for region, translation in zip(valid_regions, translations, strict=True):
                 region.translated_text = translation
-            return translatable_regions, False
+            return valid_regions, False
         except Exception as error:
             logger.warning("Translation failed; saving the original image instead: %s", error)
             return [], True
@@ -271,14 +291,75 @@ def _check_cancelled(cancel_event: Event | None) -> None:
         raise RuntimeError("Processing cancelled because the viewer was closed.")
 
 
-def _translation_candidates(regions: list[OCRResult], minimum_confidence: float = 0.5) -> list[OCRResult]:
+_PUNCTUATION_CHARS = frozenset("…‥・:：、。!?！？-〜ー—~\"'()（）[]「」『』〈〉《》")
+
+
+def _is_punctuation(ch: str) -> bool:
+    return ch in _PUNCTUATION_CHARS or unicodedata.category(ch).startswith("P")
+
+
+def compute_ocr_quality_score(
+    sentence_confidence: float | None,
+    character_confidences: list[float] | None = None,
+    source_text: str | None = None,
+    weight_sentence: float = 0.5,
+    weight_mean: float = 0.5,
+    weight_std: float = 0.80,
+) -> float | None:
+    """Compute combined OCR quality score from sentence confidence, mean char confidence, and char std.
+
+    Score formula:
+        score = weight_sentence * S + weight_mean * mean(chars) - weight_std * std(chars)
+
+    Punctuation marks (e.g. ellipsis '…', colons '：', commas '、') are excluded from
+    character distribution metrics when content characters exist, preventing ambiguous
+    punctuation dots from dragging down the quality score of genuine sentences.
+    """
+    if sentence_confidence is None:
+        return None
+
+    if not character_confidences:
+        return float(sentence_confidence)
+
+    eval_confidences = character_confidences
+    if source_text is not None and len(source_text) == len(character_confidences):
+        content_confs = [c for c, ch in zip(character_confidences, source_text) if not _is_punctuation(ch)]
+        if content_confs:
+            eval_confidences = content_confs
+
+    mean_char = float(sum(eval_confidences) / len(eval_confidences))
+    if len(eval_confidences) > 1:
+        variance = sum((c - mean_char) ** 2 for c in eval_confidences) / len(eval_confidences)
+        std_char = float(np.sqrt(variance))
+    else:
+        std_char = 0.0
+
+    return float(weight_sentence * sentence_confidence + weight_mean * mean_char - weight_std * std_char)
+
+
+def _translation_candidates(
+    regions: list[OCRResult],
+    minimum_confidence: float = 0.75,
+    weight_sentence: float = 0.5,
+    weight_mean: float = 0.5,
+    weight_std: float = 0.80,
+) -> list[OCRResult]:
     candidates: list[OCRResult] = []
     for region in regions:
-        if region.confidence is not None and region.confidence < minimum_confidence:
+        score = compute_ocr_quality_score(
+            region.confidence,
+            region.character_confidences,
+            source_text=region.source_text,
+            weight_sentence=weight_sentence,
+            weight_mean=weight_mean,
+            weight_std=weight_std,
+        )
+        if score is not None and score < minimum_confidence:
             logger.warning(
-                "Skipping translation for low-confidence OCR entry: %s (sentence confidence: %.4f, minimum: %.4f)",
+                "Skipping translation for low-confidence OCR entry: %s (quality score: %.4f, sentence confidence: %s, minimum: %.4f)",
                 region.source_text,
-                region.confidence,
+                score,
+                f"{region.confidence:.4f}" if region.confidence is not None else "unavailable",
                 minimum_confidence,
             )
             continue

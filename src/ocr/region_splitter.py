@@ -274,3 +274,58 @@ def resolve_overlapping_regions(regions: list[TextRegion], threshold: float = 1.
             result.append(replace(regions[base], bbox=(ml, mt, mr, mb)))
 
     return result
+
+
+def region_has_text(image_array: np.ndarray, region: TextRegion, min_char_area: int = 14) -> bool:
+    """Pre-OCR verification: determine whether a region contains actual text strokes.
+
+    Discards empty speech bubbles, screentones, and circular background objects
+    before OCR, preventing autoregressive OCR models from hallucinating text.
+    """
+    l, t, r, b = region.source_bbox or region.bbox
+    h, w = b - t, r - l
+    if w < 6 or h < 6:
+        return False
+
+    roi = image_array[t:b, l:r]
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+
+    if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
+        ml, mt, mr, mb = region.layout_bbox
+        mask = np.zeros((h, w), dtype=bool)
+        ol, ot = max(l, ml), max(t, mt)
+        orr, ob = min(r, mr), min(b, mb)
+        if ol < orr and ot < ob:
+            mask[ot - t : ob - t, ol - l : orr - l] = region.layout_mask[ot - mt : ob - mt, ol - ml : orr - ml]
+        # Erode mask to safely ignore the black bubble outline
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        interior = cv2.erode(mask.astype(np.uint8), k).astype(bool)
+        if not np.any(interior):
+            interior = mask
+    else:
+        interior = np.zeros((h, w), dtype=bool)
+        pad_y = min(4, h // 4)
+        pad_x = min(4, w // 4)
+        interior[pad_y : h - pad_y, pad_x : w - pad_x] = True
+
+    pixels = gray[interior]
+    if pixels.size < 16:
+        return False
+
+    p80 = float(np.percentile(pixels, 80))
+    if p80 >= 128:
+        ink = interior & (gray <= min(180, p80 - 32))
+    else:
+        p20 = float(np.percentile(pixels, 20))
+        ink = interior & (gray >= max(100, p20 + 32))
+
+    if np.count_nonzero(ink) < min_char_area:
+        return False
+
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8))
+    for i in range(1, num_labels):
+        cw, ch, area = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT], stats[i, cv2.CC_STAT_AREA]
+        if area >= min_char_area and (cw >= 4 or ch >= 4):
+            return True
+
+    return False

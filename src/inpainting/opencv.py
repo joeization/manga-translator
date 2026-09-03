@@ -110,18 +110,24 @@ class OpenCVInpainter(Inpainter):
         if roi.size == 0:
             return
 
-        # Detected text bbox in ROI-local coordinates.
-        detect_offset = _detect_offset_in_roi(padded.bbox, roi_bbox)
+        # Detected text bbox in ROI-local coordinates (exact un-dilated detect rect).
+        detect_offset = _detect_offset_in_roi(region.bbox, roi_bbox)
         detect_mask = _text_area_mask(roi.shape[:2], detect_offset)
 
-        # Bubble segmentation mask in ROI coordinates.
+        # Bubble segmentation mask in ROI coordinates, eroded to protect the bubble border.
         bubble_mask_roi = (
             _bubble_mask_in_region(roi_bbox, bubble_bbox, bubble_mask)
             if bubble is not None
             else np.ones(roi.shape[:2], dtype=bool)
         )
+        if bubble is not None and self._bubble_border_width > 0:
+            ks = self._bubble_border_width * 2 + 1
+            k_border = np.ones((ks, ks), dtype=np.uint8)
+            eroded_bubble = cv2.erode(bubble_mask_roi.astype(np.uint8), k_border, iterations=1).astype(bool)
+            if np.any(eroded_bubble):
+                bubble_mask_roi = eroded_bubble
 
-        # Inpainting target is strictly the INTERSECTION of detect and segmentation!
+        # Inpainting target is strictly the INTERSECTION of un-dilated detect rect and segmentation interior!
         allowed = detect_mask & bubble_mask_roi
 
         bg_samples = _sample_background(roi, bubble_mask_roi, detect_offset)
@@ -154,8 +160,6 @@ class OpenCVInpainter(Inpainter):
             if len(bg_pixels) >= _MIN_BG_SAMPLES:
                 bg_color = np.median(bg_pixels, axis=0)
                 target_std = np.std(bg_pixels.astype(float), axis=0)
-            elif np.any(allowed):
-                target_std = np.std(roi[allowed].astype(float), axis=0)
             else:
                 target_std = bg_std
             is_uniform = float(np.max(target_std)) < min(2.0, self._solid_fill_std_threshold)
@@ -281,19 +285,29 @@ class OpenCVInpainter(Inpainter):
         img_w: int = 1600,
         img_h: int = 1600,
     ) -> np.ndarray:
-        adaptive_dilation = estimate_adaptive_dilation(
-            region.bbox,
-            region.source_text,
-            img_w,
-            img_h,
-            base_dilation=self._mask_dilation,
-        )
         ocr_mask = _ocr_mask_in_roi(region, roi_bbox, roi.shape[:2])
         if ocr_mask is not None and np.any(ocr_mask):
+            adaptive_dilation = estimate_adaptive_dilation(
+                region.bbox,
+                region.source_text,
+                img_w,
+                img_h,
+                base_dilation=self._mask_dilation,
+                glyph_mask=ocr_mask,
+            )
             mask = ocr_mask & allowed
             return self._dilate_glyph_mask(mask, allowed, dilation=adaptive_dilation, close=True)
         detect_offset = _detect_offset_in_roi(region.bbox, roi_bbox)
-        return self._glyph_mask(roi, allowed, detect_offset, bg_color, bg_std, dilation=adaptive_dilation)
+        return self._glyph_mask(
+            roi,
+            allowed,
+            detect_offset,
+            bg_color,
+            bg_std,
+            region=region,
+            img_w=img_w,
+            img_h=img_h,
+        )
 
     def _dilate_glyph_mask(
         self,
@@ -316,6 +330,9 @@ class OpenCVInpainter(Inpainter):
         detect_offset: tuple[int, int, int, int],
         bg_color: np.ndarray,
         bg_std: np.ndarray,
+        region: TextRegion | None = None,
+        img_w: int = 1600,
+        img_h: int = 1600,
         dilation: int = 2,
     ) -> np.ndarray:
         """Detect text glyphs as pixels that deviate from the estimated background."""
@@ -336,11 +353,36 @@ class OpenCVInpainter(Inpainter):
             dark_text = allowed & (gray <= self._dark_threshold)
             bright_text = np.zeros(roi.shape[:2], dtype=bool)
 
-        candidate = color_text | dark_text | bright_text
-        if not np.any(candidate):
+        raw_candidate = color_text | dark_text | bright_text
+        if not np.any(raw_candidate):
             return np.zeros(roi.shape[:2], dtype=bool)
 
-        return self._dilate_glyph_mask(candidate, allowed, dilation=dilation)
+        # Anchor to detect rect: keep connected components that overlap with detect_rect
+        # (allowing stylized/artistic text to extend outward, while ignoring unrelated bubble art)
+        detect_rect = _text_area_mask(roi.shape[:2], detect_offset)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(raw_candidate.astype(np.uint8))
+        candidate = np.zeros_like(raw_candidate)
+        for i in range(1, num_labels):
+            comp_mask = labels == i
+            if np.any(comp_mask & detect_rect):
+                candidate |= comp_mask
+
+        if not np.any(candidate):
+            candidate = raw_candidate & detect_rect
+
+        if region is not None:
+            actual_dilation = estimate_adaptive_dilation(
+                region.bbox,
+                region.source_text,
+                img_w,
+                img_h,
+                base_dilation=self._mask_dilation,
+                glyph_mask=candidate,
+            )
+        else:
+            actual_dilation = dilation
+
+        return self._dilate_glyph_mask(candidate, allowed, dilation=actual_dilation)
 
     def _find_bubble(
         self, pixels: np.ndarray, region: TextRegion

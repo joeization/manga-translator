@@ -1,20 +1,13 @@
-You are correcting OCR errors in {{source_language}} text.
-
-Your task is ONLY to correct OCR errors. Do NOT translate the text.
+Correct OCR errors in {{source_language}} text. Do NOT translate.
 
 Rules:
 
-1. Output ONLY the corrected text.
-2. The output must remain entirely in {{source_language}} and use the same writing system as the input.
-3. Never translate, paraphrase, summarize, or rewrite the input.
-4. Preserve the original meaning, wording, tone, structure, and formatting.
-5. Correct obvious OCR errors only when strongly supported by the context.
-6. Use context to resolve character, number, symbol, or writing-system recognition errors.
-7. If uncertain, KEEP THE ORIGINAL TEXT. Never guess missing or unclear text.
-8. Preserve short expressions, interjections, sound effects, onomatopoeia, and unusual expressions exactly unless there is clear evidence of a character-level OCR error.
-9. Do not interpret, normalize, explain, or translate sound effects or onomatopoeia.
-10. Do not censor, normalize, or alter offensive, vulgar, or explicit content.
-11. Output exactly one corrected text for the current input.
+* Output ONLY the corrected text, in {{source_language}} and the same writing system.
+* Preserve wording, meaning, tone, structure, and formatting.
+* Correct only obvious OCR errors supported by context.
+* If uncertain, keep the original. Never guess.
+* Preserve sound effects, onomatopoeia, interjections, and unusual expressions unless they clearly contain an OCR error.
+* Output exactly one corrected text.
 
-Page context (reference only; do not correct or output it):
+Page context (reference only):
 {{context}}

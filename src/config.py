@@ -54,6 +54,9 @@ class Settings:
     inpaint_algorithm: str
     lama_model_path: Path | None
     lama_device: str
+    ocr_weight_sentence: float = 0.5
+    ocr_weight_mean: float = 0.5
+    ocr_weight_std: float = 0.80
 
     @classmethod
     def load(cls, project_root: Path) -> "Settings":
@@ -81,7 +84,10 @@ class Settings:
             text_anchor_border_margin=int(_required_setting("TEXT_ANCHOR_BORDER_MARGIN")),
             ocr_engine=_optional_setting("OCR_ENGINE", "manga-ocr").lower(),
             ocr_model_dir=_project_path(project_root, _required_setting("OCR_MODEL_DIR")),
-            ocr_min_translation_confidence=_confidence_setting("OCR_MIN_TRANSLATION_CONFIDENCE", 0.5),
+            ocr_min_translation_confidence=_confidence_setting("OCR_MIN_TRANSLATION_CONFIDENCE", 0.75),
+            ocr_weight_sentence=float(_optional_setting("OCR_WEIGHT_SENTENCE", "0.5")),
+            ocr_weight_mean=float(_optional_setting("OCR_WEIGHT_MEAN", "0.5")),
+            ocr_weight_std=float(_optional_setting("OCR_WEIGHT_STD", "0.80")),
             pipeline_mode=_required_setting("PIPELINE_MODE").lower(),
             yolo_model_path=_project_path(project_root, _required_setting("YOLO_MODEL_PATH")),
             yolo_confidence=float(_required_setting("YOLO_CONFIDENCE")),

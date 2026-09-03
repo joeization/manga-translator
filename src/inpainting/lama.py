@@ -231,21 +231,42 @@ def _extract_text_glyph_mask(
 
     # Compute bubble segmentation mask in ROI local coordinates if available
     seg_mask: np.ndarray | None = None
+    interior_seg: np.ndarray | None = None
     if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
         seg_mask = _bubble_mask_in_region((pl, pt, pr, pb), region.layout_bbox, region.layout_mask)
+        if seg_mask is not None and np.any(seg_mask):
+            # Protect speech bubble border: erode by border margin (3px) so bubble outline is never masked or dilated
+            k_border = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            eroded = cv2.erode(seg_mask.astype(np.uint8), k_border, iterations=1).astype(bool)
+            interior_seg = eroded if np.any(eroded) else seg_mask
 
-    # 1. Prioritize explicit ocr_mask or inpaint_mask if available
-    for mask_source in (region.ocr_mask, region.inpaint_mask):
-        if isinstance(mask_source, np.ndarray) and mask_source.shape[:2] == roi.shape[:2]:
-            mask = mask_source.astype(bool)
-            if mask.ndim == 3:
-                mask = np.any(mask, axis=2)
-            if np.any(mask):
-                ks = adaptive_dilation * 2 + 1
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
-                dilated = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-                if seg_mask is not None and np.any(seg_mask):
-                    dilated = dilated & seg_mask
+    # Detect rect in ROI coordinates
+    detect_rect = np.zeros(roi.shape[:2], dtype=bool)
+    dt = max(0, rt - pt)
+    db = min(pb - pt, rb - pt)
+    dl = max(0, rl - pl)
+    dr = min(pr - pl, rr - pl)
+    detect_rect[dt:db, dl:dr] = True
+
+    # Strict allowed boundary: MUST be within detect_rect AND within segmentation interior
+    if interior_seg is not None and np.any(interior_seg):
+        allowed_boundary = detect_rect & interior_seg
+    elif seg_mask is not None and np.any(seg_mask):
+        allowed_boundary = detect_rect & seg_mask
+    else:
+        allowed_boundary = detect_rect
+
+    # 1. Prioritize explicit ocr_mask if available (clipped to interior)
+    if isinstance(region.ocr_mask, np.ndarray) and region.ocr_mask.shape[:2] == roi.shape[:2]:
+        mask = region.ocr_mask.astype(bool)
+        if mask.ndim == 3:
+            mask = np.any(mask, axis=2)
+        if np.any(mask):
+            ks = adaptive_dilation * 2 + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+            dilated = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+            dilated = dilated & allowed_boundary
+            if np.any(dilated):
                 return dilated, (pl, pt, pr, pb)
 
     # 2. Extract text glyph strokes and stroke outlines (描邊 / 袋文字)
@@ -259,42 +280,50 @@ def _extract_text_glyph_mask(
 
     # Dark text or text with outlines on light background (standard manga)
     if p75 >= 128:
-        glyph_mask = (gray <= min(190, p75 - 25)) | outline_mask
+        raw_glyph_mask = (gray <= min(190, p75 - 25)) | outline_mask
     else:  # Light text on dark background
         p25 = float(np.percentile(gray, 25))
-        glyph_mask = (gray >= max(100, p25 + 25)) | outline_mask
+        raw_glyph_mask = (gray >= max(100, p25 + 25)) | outline_mask
 
-    # Dilate glyph mask using actual measured glyph font size and stroke width to swallow text outlines (描邊)
-    actual_dilation = estimate_adaptive_dilation(
-        region.bbox,
-        region.source_text,
-        img_w,
-        img_h,
-        base_dilation=mask_dilation,
-        glyph_mask=glyph_mask,
-    )
-    ks = actual_dilation * 2 + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
-    dilated_glyph = cv2.dilate(glyph_mask.astype(np.uint8), kernel, iterations=1) > 0
+    # Crucial: Restrict raw glyph extraction strictly to allowed boundary (inside rect & segmentation interior)
+    raw_glyph_mask = raw_glyph_mask & allowed_boundary
 
-    # Crucial: Intersect with bubble segmentation mask so inpainting never exceeds the bubble boundary
+    # Filter out tiny screentone noise specks (area < 3) on complex backgrounds
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(raw_glyph_mask.astype(np.uint8))
+    glyph_mask = np.zeros_like(raw_glyph_mask)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= 3:
+            glyph_mask |= (labels == i)
+
+    if not np.any(glyph_mask):
+        glyph_mask = raw_glyph_mask
+
+    if np.any(glyph_mask):
+        # Dilate glyph mask using actual measured glyph font size and stroke width to swallow text outlines (描邊)
+        actual_dilation = estimate_adaptive_dilation(
+            region.bbox,
+            region.source_text,
+            img_w,
+            img_h,
+            base_dilation=mask_dilation,
+            glyph_mask=glyph_mask,
+        )
+        ks = actual_dilation * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+        dilated_glyph = cv2.dilate(glyph_mask.astype(np.uint8), kernel, iterations=1) > 0
+
+        # Confine glyph dilation strictly inside allowed boundary (never outside rect, never outside segmentation)
+        dilated_glyph = dilated_glyph & allowed_boundary
+
+        if np.any(dilated_glyph):
+            return dilated_glyph, (pl, pt, pr, pb)
+
+    # 3. Fallback for detect box (rect inpaint):
+    # Strictly clip detect box within segmentation interior (NEVER dilate rect outwards)
     if seg_mask is not None and np.any(seg_mask):
-        dilated_glyph = dilated_glyph & seg_mask
-
-    if np.any(dilated_glyph):
-        return dilated_glyph, (pl, pt, pr, pb)
-
-    # Fallback for detect box: intersect detect box with segmentation mask (never use raw unclipped rect)
-    if seg_mask is not None and np.any(seg_mask):
-        detect_rect = np.zeros(roi.shape[:2], dtype=bool)
-        dt = max(0, rt - pt)
-        db = min(pb - pt, rb - pt)
-        dl = max(0, rl - pl)
-        dr = min(pr - pl, rr - pl)
-        detect_rect[dt:db, dl:dr] = True
-        clipped_mask = detect_rect & seg_mask
-        if np.any(clipped_mask):
-            return clipped_mask, (pl, pt, pr, pb)
+        clipped_rect = detect_rect & allowed_boundary
+        if np.any(clipped_rect):
+            return clipped_rect, (pl, pt, pr, pb)
 
     return None, None
 

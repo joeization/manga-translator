@@ -364,6 +364,9 @@ def main() -> int:
             build_renderer(settings),
             build_anchor_detector(settings),
             settings.ocr_min_translation_confidence,
+            ocr_weight_sentence=settings.ocr_weight_sentence,
+            ocr_weight_mean=settings.ocr_weight_mean,
+            ocr_weight_std=settings.ocr_weight_std,
         )
         images: Queue = Queue()
         failures = [0]
