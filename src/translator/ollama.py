@@ -38,11 +38,11 @@ class _OllamaEntryClient:
         except OSError as error:
             raise TranslationError(f"Could not read prompt file {prompt_path}: {error}") from error
 
-    def _process(self, texts: list[str], context_texts: list[str] | None = None) -> list[str]:
+    def _process(self, texts: list[str], context_texts: list[str] | None = None, correct: bool = False) -> list[str]:
         if not texts:
             return []
         context = "\n".join(context_texts if context_texts is not None else texts)
-        return [self._request(context, text) for text in texts]
+        return [self._request(context, text, correct) for text in texts]
 
     def _build_system_prompt(self, context: str) -> str:
         return self._system_prompt.replace("{{context}}", context)
@@ -50,10 +50,16 @@ class _OllamaEntryClient:
     def _build_user_message(self, source_text: str) -> str:
         return source_text
 
-    def _request(self, context: str, source_text: str) -> str:
+    def _request(self, context: str, source_text: str, correct: bool) -> str:
         system_prompt = self._build_system_prompt(context)
         logger.info("Ollama request for entry: %s", source_text)
         try:
+            if correct:
+                temperature = 0
+                top_p = 0.9
+            else:
+                temperature = 0.3
+                top_p = 0.8
             response = self._session.post(
                 self._endpoint,
                 json={
@@ -61,9 +67,10 @@ class _OllamaEntryClient:
                     "stream": False,
                     "think": False,
                     "options": {
-                        "temperature": 0,
+                        "temperature": temperature,
+                        "top_p": top_p,
                         "num_ctx": 8192,
-                        "num_predict": 512,
+                        "num_predict": 256,
                         "stop": ["\n"],
                     },
                     "messages": [
@@ -116,7 +123,7 @@ class OllamaTranslator(Translator, _OllamaEntryClient):
         self._target_language = target_language
 
     def translate(self, texts: list[str], context_texts: list[str] | None = None) -> list[str]:
-        return self._process(texts, context_texts)
+        return self._process(texts, context_texts, correct=False)
 
     def _build_system_prompt(self, context: str) -> str:
         return (
@@ -165,7 +172,7 @@ class OllamaCorrector(_OllamaEntryClient):
         return f"{self._source_language} OCR correction only; do not translate: {source_text}"
 
     def _request(self, context: str, source_text: str) -> str:
-        result = super()._request(context, source_text)
+        result = super()._request(context, source_text, correct=True)
         logger.info("OCR correction result: %s -> %s", source_text, result)
         if _contains_japanese_kana(source_text) and not _contains_japanese_kana(result):
             logger.warning("OCR correction replaced Japanese text with a non-Japanese response; using the original OCR text.")

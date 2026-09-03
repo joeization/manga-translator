@@ -56,16 +56,17 @@ def _valid_split_points(bands: list[tuple[int, int]], total: int, min_sub_size: 
     A final pass drops the last accepted point if it would leave a trailing
     segment that is too short.
     """
-    kept: list[int] = []
-    prev = 0
-    for start, end in bands:
-        pt = (start + end) // 2
-        if pt - prev >= min_sub_size:
-            kept.append(pt)
-            prev = pt
-    if kept and total - kept[-1] < min_sub_size:
-        kept.pop()
-    return kept
+    valid = [
+        (start, end)
+        for start, end in bands
+        if start >= min_sub_size and total - end >= min_sub_size
+    ]
+
+    if not valid:
+        return []
+
+    start, end = max(valid, key=lambda band: band[1] - band[0])
+    return [(start + end) // 2]
 
 
 def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.ndarray | None = None) -> list[TextRegion]:
@@ -119,8 +120,8 @@ def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.n
     if w_region <= round(median_w * 2.5):
         return [region]
 
-    min_y_gap = max(30, round(median_h * 1.0))
-    min_x_gap = max(30, round(median_w * 1.8))
+    min_y_gap = max(30, round(median_h * 0.7))
+    min_x_gap = max(30, round(median_w * 1.2))
     min_sub_h = max(35, round(median_h * 1.6))
     min_sub_w = max(35, round(median_w * 1.6))
 

@@ -1,13 +1,10 @@
-Correct OCR errors in {{source_language}} text. Do NOT translate.
+Correct obvious OCR errors in the following {{source_language}} text. Do NOT translate.
 
 Rules:
-
-* Output ONLY the corrected text, in {{source_language}} and the same writing system.
-* Preserve wording, meaning, tone, structure, and formatting.
-* Correct only obvious OCR errors supported by context.
-* If uncertain, keep the original. Never guess.
-* Preserve sound effects, onomatopoeia, interjections, and unusual expressions unless they clearly contain an OCR error.
-* Output exactly one corrected text.
+* Output ONLY the corrected text: Must be in {{source_language}} using the original writing system. No conversational filler or explanations.
+* Strict Preservation: Maintain the exact original wording, tone, structure, punctuation, and formatting. Do not rewrite for style or flow.
+* Conservative Correction: Fix ONLY obvious typographical/OCR errors supported by the context. If an error is ambiguous, keep the original text. Never guess or hallucinate text.
+* Edge Cases: Preserve onomatopoeia, interjections, slang, and intentional stylistic quirks. Do not "correct" valid unusual expressions.
 
 Page context (reference only):
 {{context}}

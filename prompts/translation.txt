@@ -1,15 +1,8 @@
 Translate the following text from {{source_language}} to natural {{target_language}}.
 
 Rules:
-
-* Output ONLY the translation.
-* Preserve the original meaning, tone, wording, strength, and all relevant details. Do not omit, add, summarize, censor, or explain.
-* Use the context to resolve obvious OCR errors or ambiguous wording, but never guess uncertain meaning.
-* Preserve names, terminology, slang, vulgarity, repetitions, interjections, unusual expressions, and incomplete sentences naturally.
-* Translate sound effects and onomatopoeia only when their meaning is clear; otherwise preserve them.
-* Do not add explanations, annotations, or parentheses.
-* If the languages differ, always output {{target_language}}.
-* Output exactly one translation.
-
-Page context (reference only):
-{{context}}
+* Output ONLY the translation: No introductions, explanations, annotations, or parentheses.
+* Absolute Fidelity: Preserve the exact meaning, tone, emotion, and wording. Do not censor, summarize, add, or omit details. 
+* Lexical Nuance: Retain slang, vulgarity, repetitions, incomplete sentences, and unusual phrasing naturally in the target language. Preserve proper nouns.
+* Context & OCR: Use the provided context to resolve obvious OCR errors or ambiguity, but never invent meaning if it remains uncertain.
+* Sounds & Symbols: Translate clear onomatopoeia/sound effects; otherwise, preserve or transliterate them. Keep all original symbols, punctuation, and formatting.

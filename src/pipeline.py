@@ -306,15 +306,23 @@ def compute_ocr_quality_score(
     weight_sentence: float = 0.5,
     weight_mean: float = 0.5,
     weight_std: float = 0.80,
+    weight_low_conf: float = 0.25,
+    low_conf_threshold: float = 0.5,
 ) -> float | None:
-    """Compute combined OCR quality score from sentence confidence, mean char confidence, and char std.
+    """Compute combined OCR quality score.
 
-    Score formula:
-        score = weight_sentence * S + weight_mean * mean(chars) - weight_std * std(chars)
+    Score is based on:
+        - sentence-level confidence
+        - mean character confidence
+        - proportion of low-confidence characters
+        - standard deviation of character confidences
 
-    Punctuation marks (e.g. ellipsis '…', colons '：', commas '、') are excluded from
-    character distribution metrics when content characters exist, preventing ambiguous
-    punctuation dots from dragging down the quality score of genuine sentences.
+    A single low-confidence character should not strongly penalize the whole
+    sentence. The low-confidence penalty increases as the proportion of
+    unreliable characters increases.
+
+    Punctuation marks are excluded from character-level metrics when
+    source_text is available and lengths match.
     """
     if sentence_confidence is None:
         return None
@@ -323,19 +331,43 @@ def compute_ocr_quality_score(
         return float(sentence_confidence)
 
     eval_confidences = character_confidences
+
+    # Exclude punctuation from character-level evaluation.
     if source_text is not None and len(source_text) == len(character_confidences):
-        content_confs = [c for c, ch in zip(character_confidences, source_text) if not _is_punctuation(ch)]
+        content_confs = [
+            c
+            for c, ch in zip(character_confidences, source_text)
+            if not _is_punctuation(ch)
+        ]
         if content_confs:
             eval_confidences = content_confs
 
-    mean_char = float(sum(eval_confidences) / len(eval_confidences))
-    if len(eval_confidences) > 1:
-        variance = sum((c - mean_char) ** 2 for c in eval_confidences) / len(eval_confidences)
-        std_char = float(np.sqrt(variance))
-    else:
-        std_char = 0.0
+    if not eval_confidences:
+        return float(sentence_confidence)
 
-    return float(weight_sentence * sentence_confidence + weight_mean * mean_char - weight_std * std_char)
+    mean_char = float(sum(eval_confidences) / len(eval_confidences))
+    std_char = float((sum((c - mean_char) ** 2 for c in eval_confidences) / len(eval_confidences)) ** 0.5)
+
+    # Penalize the proportion of characters with suspiciously low confidence.
+    #
+    # Example:
+    #   [0.26, 0.95, 1.00, 1.00, 1.00]
+    #   low_conf_ratio = 0.2
+    #
+    #   [0.26, 0.31, 0.42, 0.45, 0.48]
+    #   low_conf_ratio = 1.0
+    low_conf_ratio = sum(
+        c < low_conf_threshold for c in eval_confidences
+    ) / len(eval_confidences)
+
+    score = (
+        weight_sentence * sentence_confidence
+        + weight_mean * mean_char
+        - weight_low_conf * low_conf_ratio
+        - weight_std * std_char * 0.1
+    )
+
+    return float(score)
 
 
 def _translation_candidates(
