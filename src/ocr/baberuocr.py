@@ -80,9 +80,14 @@ class BaberuOCR:
             all_split_regions.extend(split_text_regions(image, region, image_array=image_array))
 
         all_split_regions = resolve_overlapping_regions(all_split_regions, threshold=0.35)
+        if not all_split_regions:
+            return []
+
+        crops = [crop_for_ocr(image, text_region) for text_region in all_split_regions]
+        recognitions = self._recognize_all(crops)
+
         regions: list[OCRResult] = []
-        for text_region in all_split_regions:
-            text, character_confidences = self._recognize(crop_for_ocr(image, text_region))
+        for text_region, (text, character_confidences) in zip(all_split_regions, recognitions, strict=True):
             text, character_confidences = _strip_text_and_confidences(text, character_confidences)
             if text:
                 text_region.source_text = text
@@ -145,12 +150,27 @@ class BaberuOCR:
 
     @torch.inference_mode()
     def _recognize(self, image: Image.Image) -> tuple[str, list[float] | None]:
+        results = self._recognize_batch([image])
+        return results[0] if results else ("", None)
+
+    @torch.inference_mode()
+    def _recognize_batch(self, images: list[Image.Image]) -> list[tuple[str, list[float] | None]]:
+        if not images:
+            return []
         assert self._model is not None
         assert self._tokenizer is not None
         assert self._image_processor is not None
         assert self._device is not None
-        pixel_values = self._image_processor(image.convert("RGB"), return_tensors="pt")["pixel_values"].to(self._device)
-        input_ids = torch.tensor([[self._tokenizer.bos_token_id]], device=self._device)
+
+        rgb_images = [image.convert("RGB") for image in images]
+        pixel_values = self._image_processor(rgb_images, return_tensors="pt")["pixel_values"].to(self._device)
+        batch_size = len(images)
+        input_ids = torch.full(
+            (batch_size, 1),
+            self._tokenizer.bos_token_id,
+            dtype=torch.long,
+            device=self._device,
+        )
         output = self._model.generate(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -165,12 +185,27 @@ class BaberuOCR:
             return_dict_in_generate=True,
             output_scores=True,
         )
-        return _decode_with_character_confidences(
-            output.sequences[0, input_ids.shape[1]:].cpu().tolist(),
-            output.scores,
-            self._tokenizer,
-            self._tokenizer.eos_token_id,
-        )
+        gen_token_ids = output.sequences[:, input_ids.shape[1]:].cpu().tolist()
+        results: list[tuple[str, list[float] | None]] = []
+        for batch_idx in range(batch_size):
+            results.append(
+                _decode_with_character_confidences(
+                    gen_token_ids[batch_idx],
+                    output.scores,
+                    self._tokenizer,
+                    self._tokenizer.eos_token_id,
+                    batch_idx=batch_idx,
+                    pad_token_id=self._tokenizer.pad_token_id,
+                )
+            )
+        return results
+
+    def _recognize_all(self, images: list[Image.Image], chunk_size: int = 8) -> list[tuple[str, list[float] | None]]:
+        results: list[tuple[str, list[float] | None]] = []
+        for i in range(0, len(images), chunk_size):
+            chunk = images[i : i + chunk_size]
+            results.extend(self._recognize_batch(chunk))
+        return results
 
 
 def _is_content_character(character: str) -> bool:
@@ -178,20 +213,29 @@ def _is_content_character(character: str) -> bool:
 
 
 def _decode_with_character_confidences(
-    token_ids: list[int], scores: tuple[torch.Tensor, ...], tokenizer: BaberuTokenizer, eos_token_id: int
+    token_ids: list[int],
+    scores: tuple[torch.Tensor, ...],
+    tokenizer: BaberuTokenizer,
+    eos_token_id: int,
+    batch_idx: int = 0,
+    pad_token_id: int | None = None,
 ) -> tuple[str, list[float] | None]:
-    if len(token_ids) != len(scores):
+    if len(token_ids) > len(scores):
         return tokenizer.decode(token_ids, skip_special_tokens=True), None
 
     characters: list[str] = []
     character_confidences: list[float] = []
-    for index, (token_id, logits) in enumerate(zip(token_ids, scores, strict=True)):
-        if token_id == eos_token_id and index == len(token_ids) - 1:
-            continue
+    for index, token_id in enumerate(token_ids):
+        if pad_token_id is not None and token_id == pad_token_id:
+            break
+        if token_id == eos_token_id:
+            break
         character = tokenizer.decode([token_id], skip_special_tokens=False)
         if len(character) != 1:
             return tokenizer.decode(token_ids, skip_special_tokens=True), None
-        probability = torch.softmax(logits[0].float(), dim=-1)[token_id].item()
+        logits = scores[index]
+        logits_item = logits[batch_idx] if logits.ndim > 1 else logits
+        probability = torch.softmax(logits_item.float(), dim=-1)[token_id].item()
         characters.append(character)
         character_confidences.append(float(probability))
     return "".join(characters), character_confidences
