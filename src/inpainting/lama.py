@@ -99,9 +99,11 @@ class LamaInpainter(Inpainter):
 
         # Build composite mask for original text glyphs (prioritizing glyph strokes over full bubble)
         full_mask = np.zeros((h, w), dtype=np.uint8)
+        valid_bboxes: list[tuple[int, int, int, int]] = []
         for region in regions:
             mask, bbox = _extract_text_glyph_mask(img_rgb, region, h, w)
             if mask is not None and bbox is not None:
+                valid_bboxes.append(bbox)
                 rl, rt, rr, rb = bbox
                 mask_uint8 = mask.astype(np.uint8) * 255
                 mh, mw = mask_uint8.shape[:2]
@@ -117,11 +119,6 @@ class LamaInpainter(Inpainter):
             return image
 
         # Cluster nearby bboxes for high-resolution ROI patch inpainting
-        valid_bboxes = [
-            _extract_text_glyph_mask(img_rgb, r, h, w)[1]
-            for r in regions
-            if _extract_text_glyph_mask(img_rgb, r, h, w)[1] is not None
-        ]
         roi_clusters = _cluster_bboxes(valid_bboxes, margin=48, img_w=w, img_h=h)
 
         output_pixels = img_rgb.copy()
@@ -239,20 +236,26 @@ def _cluster_bboxes(
     if not bboxes:
         return []
 
-    expanded = [
+    merged = [
         (max(0, l - margin), max(0, t - margin), min(img_w, r + margin), min(img_h, b + margin))
         for l, t, r, b in bboxes
     ]
 
-    merged: list[tuple[int, int, int, int]] = []
-    for cur_l, cur_t, cur_r, cur_b in expanded:
-        placed = False
-        for idx, (ml, mt, mr, mb) in enumerate(merged):
-            if max(cur_l, ml) < min(cur_r, mr) and max(cur_t, mt) < min(cur_b, mb):
-                merged[idx] = (min(cur_l, ml), min(cur_t, mt), max(cur_r, mr), max(cur_b, mb))
-                placed = True
-                break
-        if not placed:
-            merged.append((cur_l, cur_t, cur_r, cur_b))
+    while True:
+        changed = False
+        new_merged: list[tuple[int, int, int, int]] = []
+        for cur_l, cur_t, cur_r, cur_b in merged:
+            placed = False
+            for idx, (ml, mt, mr, mb) in enumerate(new_merged):
+                if max(cur_l, ml) < min(cur_r, mr) and max(cur_t, mt) < min(cur_b, mb):
+                    new_merged[idx] = (min(cur_l, ml), min(cur_t, mt), max(cur_r, mr), max(cur_b, mb))
+                    placed = True
+                    changed = True
+                    break
+            if not placed:
+                new_merged.append((cur_l, cur_t, cur_r, cur_b))
+        merged = new_merged
+        if not changed:
+            break
 
     return merged
