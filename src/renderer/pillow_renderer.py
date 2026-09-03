@@ -4,6 +4,7 @@ Supports horizontal and vertical-rtl text directions, mask-aware bubble layout,
 and two-pass outward-only white/dark stroke outline rendering.
 """
 from __future__ import annotations
+from src.translator.ollama import format_response
 
 import re
 from pathlib import Path
@@ -41,21 +42,10 @@ VERTICAL_PUNCTUATION_MAP = {
     "\u2014": "\ufe31",  # — -> ︱
     "-": "\ufe31",       # - -> ︱
     "\u2026": "\ufe19",  # … -> ︙
-    "\u22ee": "\ufe19",  # ⋮ -> ︙
 }
-
-
-def strip_leading_ellipsis(text: str) -> str:
-    """Remove leading ellipsis, dots, or dashes from translated text while preserving pure ellipsis text."""
-    if not text:
-        return ""
-    clean = re.sub(r"^[\s.…⋯︙·\-—~～]+", "", text).strip()
-    return clean if clean else text.strip()
-
 
 def to_vertical_text(text: str) -> str:
     """Convert horizontal punctuation and brackets to vertical orientation symbols."""
-    text = strip_leading_ellipsis(text)
     return "".join(VERTICAL_PUNCTUATION_MAP.get(char, char) for char in text)
 
 
@@ -397,17 +387,6 @@ class MaskAwarePillowRenderer(PillowRenderer):
         layout_left, layout_top, _, _ = region.layout_bbox
         fill = self._text_color(region)
 
-        # For vertical-rtl text with a layout mask, use the FULL mask without clipping by
-        # render_bounds. The layout_mask already defines the exact bubble shape; render_bounds
-        # is only needed to avoid text colliding with adjacent bubbles, but clipping the mask
-        # would cut off connected lobes (e.g. the lower lobe of a figure-8 bubble).
-        if self._text_direction == "vertical-rtl":
-            bx, by, bw, bh = cv2.boundingRect(mask)
-            if bw > 0 and bh > 0:
-                sub_mask = mask[by : by + bh, bx : bx + bw]
-                self._render_vertical_mask_region(draw, region, sub_mask, layout_left + bx, layout_top + by, bw, bh)
-                return
-
         if render_bounds is not None:
             target_left, target_top, target_right, target_bottom = render_bounds
         else:
@@ -421,15 +400,23 @@ class MaskAwarePillowRenderer(PillowRenderer):
             super()._render_region(draw, region, render_bounds=render_bounds)
             return
 
+        # Find the mask pixels strictly within render_bounds
         allowed = np.zeros_like(mask)
         allowed[top:bottom, left:right] = 1
-        mask = np.logical_and(mask, allowed).astype(np.uint8)
-        if not np.any(mask):
+        clipped = np.logical_and(mask, allowed).astype(np.uint8)
+        if not np.any(clipped):
             super()._render_region(draw, region, render_bounds=render_bounds)
             return
-        x, y, width, height = cv2.boundingRect(mask)
-        mask = mask[y : y + height, x : x + width]
+
+        x, y, width, height = cv2.boundingRect(clipped)
+        mask = clipped[y : y + height, x : x + width]
         left, top = layout_left, layout_top
+        fill = self._text_color(region)
+
+        if self._text_direction == "vertical-rtl":
+            self._render_vertical_mask_region(draw, region, mask, left + x, top + y, width, height)
+            return
+
 
         # Option A for horizontal text: Try Maximum Inscribed Rectangle first
         inscribed = find_maximum_inscribed_rectangle(mask)

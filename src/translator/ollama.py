@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 from pathlib import Path
@@ -25,21 +25,10 @@ def _strip_code_fence(content: str) -> str:
     return text.strip()
 
 
-def _to_lang_name(lang: str) -> str:
-    mapping = {
-        "japanese": "日文",
-        "traditional chinese": "繁体中文",
-        "simplified chinese": "简体中文",
-        "chinese": "中文",
-        "english": "英文",
-    }
-    return mapping.get(lang.strip().lower(), lang.strip())
-
-
 def _parse_indexed_output(content: str, expected_count: int) -> list[str | None]:
     """Parse model output with [1], [2] or 1. tags into a list of translations."""
     results: list[str | None] = [None] * expected_count
-    pattern = re.compile(r"^\s*\[?(\d+)\]?[\s.:、\-—]*(.*)$")
+    pattern = re.compile(r"^\s*\[?(\d+)\]?[\s.:：、\-—]*(.*)$")
     current_idx: int | None = None
     current_lines: list[str] = []
 
@@ -179,7 +168,7 @@ class OllamaTranslator(Translator):
                         )
                         res_lines = [l.strip() for l in single_res.splitlines() if l.strip()]
                         clean = res_lines[0] if res_lines else single_res.strip()
-                        clean = re.sub(r"^\s*\[?\d+\]?[\s.:、\-—]*", "", clean).strip()
+                        clean = re.sub(r"^\s*\[?\d+\]?[\s.:：、\-—]*", "", clean).strip()
                         parsed[idx] = clean
                     return [format_response(p) if p is not None else sanitized_texts[i] for i, p in enumerate(parsed)]
             except Exception as error:
@@ -196,7 +185,7 @@ class OllamaTranslator(Translator):
             )
             res_lines = [l.strip() for l in single_res.splitlines() if l.strip()]
             clean = res_lines[0] if res_lines else single_res.strip()
-            clean = re.sub(r"^\s*\[?\d+\]?[\s.:、\-—]*", "", clean).strip()
+            clean = re.sub(r"^\s*\[?\d+\]?[\s.:：、\-—]*", "", clean).strip()
             fallback_results.append(format_response(clean))
 
         return fallback_results
@@ -277,3 +266,4 @@ class OllamaTranslator(Translator):
         if not result:
             raise TranslationError(f"Ollama response from {self._endpoint} contained no text.")
         return result
+

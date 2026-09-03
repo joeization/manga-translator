@@ -17,7 +17,7 @@ from src.inpainting import Inpainter
 from src.models import OCRResult
 from src.ocr.postprocess import sort_manga_reading_order
 from src.renderer import Renderer, TextAnchorDetector
-from src.renderer.pillow_renderer import strip_leading_ellipsis
+from src.renderer.pillow_renderer import format_response
 from src.translator import Translator
 
 logger = logging.getLogger(__name__)
@@ -172,7 +172,7 @@ class MangaTranslationPipeline:
             texts = [region.source_text for region in valid_regions]
             translations = self._translator.translate(texts, context=context)
             for region, translation in zip(valid_regions, translations, strict=True):
-                region.translated_text = strip_leading_ellipsis(translation)
+                region.translated_text = format_response(translation)
             return valid_regions, False
         except Exception as error:
             logger.warning("Translation failed; saving the original image instead: %s", error)
