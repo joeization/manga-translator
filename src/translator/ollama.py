@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import re
 from typing import Any
 
 import requests
@@ -33,6 +34,37 @@ def _to_lang_name(lang: str) -> str:
         "english": "英文",
     }
     return mapping.get(lang.strip().lower(), lang.strip())
+
+
+def _parse_indexed_output(content: str, expected_count: int) -> list[str | None]:
+    """Parse model output with [1], [2] or 1. tags into a list of translations."""
+    results: list[str | None] = [None] * expected_count
+    pattern = re.compile(r"^\s*\[?(\d+)\]?[\s.:、\-—]*(.*)$")
+    current_idx: int | None = None
+    current_lines: list[str] = []
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower() in ("user", "assistant", "system"):
+            continue
+        match = pattern.match(line)
+        if match:
+            if current_idx is not None and 1 <= current_idx <= expected_count:
+                results[current_idx - 1] = " ".join(current_lines).strip()
+            num_str, rest = match.groups()
+            idx = int(num_str)
+            current_idx = idx
+            current_lines = [rest.strip()] if rest.strip() else []
+        else:
+            if current_idx is not None:
+                current_lines.append(line)
+
+    if current_idx is not None and 1 <= current_idx <= expected_count:
+        results[current_idx - 1] = " ".join(current_lines).strip()
+
+    return results
 
 
 class OllamaTranslator(Translator):
@@ -86,6 +118,12 @@ class OllamaTranslator(Translator):
                 logger.info("Whole-page translation succeeded (%d lines).", len(lines))
                 return lines
 
+            # Also check if model produced indexed lines [1], [2] etc.
+            indexed_try = _parse_indexed_output(content, len(sanitized_texts))
+            if all(r is not None and r.strip() for r in indexed_try):
+                logger.info("Whole-page indexed translation succeeded (%d lines).", len(indexed_try))
+                return [r.strip() for r in indexed_try if r is not None]
+
             logger.warning(
                 "Whole-page translation returned %d lines, expected %d. Falling back to single-sentence translation without context.",
                 len(lines),
@@ -97,7 +135,41 @@ class OllamaTranslator(Translator):
                 error,
             )
 
-        # 2. Fallback: translate line by line without context
+        # 2. Fast numbered batch attempt when there are multiple dialogues (> 2)
+        if len(sanitized_texts) > 2:
+            try:
+                numbered_input = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(sanitized_texts))
+                content = self._request(
+                    context=context_str,
+                    source_text=numbered_input,
+                    stop=None,
+                    max_tokens=max(512, len(sanitized_texts) * 128),
+                )
+                parsed = _parse_indexed_output(content, len(sanitized_texts))
+                if all(p is not None and p.strip() for p in parsed):
+                    logger.info("Numbered batch translation succeeded (%d lines).", len(parsed))
+                    return [p.strip() for p in parsed if p is not None]
+
+                missing_indices = [i for i, p in enumerate(parsed) if p is None or not p.strip()]
+                if len(missing_indices) < len(sanitized_texts) // 2:
+                    logger.info("Numbered batch recovered %d of %d lines, translating %d missing lines individually.",
+                                len(sanitized_texts) - len(missing_indices), len(sanitized_texts), len(missing_indices))
+                    for idx in missing_indices:
+                        single_res = self._request(
+                            context="",
+                            source_text=sanitized_texts[idx],
+                            stop=["\n"],
+                            max_tokens=256,
+                        )
+                        res_lines = [l.strip() for l in single_res.splitlines() if l.strip()]
+                        clean = res_lines[0] if res_lines else single_res.strip()
+                        clean = re.sub(r"^\s*\[?\d+\]?[\s.:、\-—]*", "", clean).strip()
+                        parsed[idx] = clean
+                    return [p if p is not None else sanitized_texts[i] for i, p in enumerate(parsed)]
+            except Exception as error:
+                logger.warning("Numbered batch attempt failed (%s). Falling back to line-by-line translation.", error)
+
+        # 3. Fallback: translate line by line without context
         fallback_results: list[str] = []
         for text in sanitized_texts:
             single_res = self._request(
@@ -107,7 +179,9 @@ class OllamaTranslator(Translator):
                 max_tokens=256,
             )
             res_lines = [l.strip() for l in single_res.splitlines() if l.strip()]
-            fallback_results.append(res_lines[0] if res_lines else single_res.strip())
+            clean = res_lines[0] if res_lines else single_res.strip()
+            clean = re.sub(r"^\s*\[?\d+\]?[\s.:、\-—]*", "", clean).strip()
+            fallback_results.append(clean)
 
         return fallback_results
 

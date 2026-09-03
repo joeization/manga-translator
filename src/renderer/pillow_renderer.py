@@ -76,6 +76,104 @@ def _expand_bbox_towards_layout(
     return (new_l, new_t, new_r, new_b)
 
 
+def compute_non_overlapping_render_bounds(
+    regions: list[TextRegion],
+) -> list[tuple[int, int, int, int]]:
+    """Compute adaptively expanded render bounding boxes that are strictly non-overlapping.
+
+    Expands each region towards its layout_bbox / surrounding bubble space, but
+    strictly bounds expansion against all other regions on the page to guarantee
+    that no two rendered regions collide or overlap.
+    """
+    n = len(regions)
+    if n == 0:
+        return []
+    if n == 1:
+        return [_expand_bbox_towards_layout(regions[0].bbox, regions[0].layout_bbox)]
+
+    expanded_bounds: list[tuple[int, int, int, int]] = []
+    for i in range(n):
+        ri = regions[i]
+        li, ti, ri_x, bi = ri.bbox
+        if ri.layout_bbox is not None:
+            lim_l, lim_t, lim_r, lim_b = ri.layout_bbox
+        else:
+            lim_l, lim_t, lim_r, lim_b = li, ti, ri_x, bi
+
+        lim_l = min(lim_l, li)
+        lim_t = min(lim_t, ti)
+        lim_r = max(lim_r, ri_x)
+        lim_b = max(lim_b, bi)
+
+        for j in range(n):
+            if i == j:
+                continue
+            rj = regions[j]
+            lj, tj, rj_x, bj = rj.bbox
+
+            v_overlap = max(0, min(bi, bj) - max(ti, tj))
+            h_overlap = max(0, min(ri_x, rj_x) - max(li, lj))
+
+            if v_overlap > 0 and h_overlap == 0:
+                if ri_x <= lj:
+                    x_sep = (ri_x + lj) // 2
+                    lim_r = min(lim_r, x_sep)
+                elif rj_x <= li:
+                    x_sep = (rj_x + li) // 2
+                    lim_l = max(lim_l, x_sep)
+            elif h_overlap > 0 and v_overlap == 0:
+                if bi <= tj:
+                    y_sep = (bi + tj) // 2
+                    lim_b = min(lim_b, y_sep)
+                elif bj <= ti:
+                    y_sep = (bj + ti) // 2
+                    lim_t = max(lim_t, y_sep)
+            elif v_overlap > 0 and h_overlap > 0:
+                if v_overlap >= h_overlap:
+                    x_sep = (max(li, lj) + min(ri_x, rj_x)) // 2
+                    if (li + ri_x) < (lj + rj_x):
+                        lim_r = min(lim_r, x_sep)
+                    else:
+                        lim_l = max(lim_l, x_sep)
+                else:
+                    y_sep = (max(ti, tj) + min(bi, bj)) // 2
+                    if (ti + bi) < (tj + bj):
+                        lim_b = min(lim_b, y_sep)
+                    else:
+                        lim_t = max(lim_t, y_sep)
+            else:
+                gap_x = max(0, max(li, lj) - min(ri_x, rj_x))
+                gap_y = max(0, max(ti, tj) - min(bi, bj))
+                if gap_x <= gap_y:
+                    if ri_x <= lj:
+                        lim_r = min(lim_r, (ri_x + lj) // 2)
+                    elif rj_x <= li:
+                        lim_l = max(lim_l, (rj_x + li) // 2)
+                else:
+                    if bi <= tj:
+                        lim_b = min(lim_b, (bi + tj) // 2)
+                    elif bj <= ti:
+                        lim_t = max(lim_t, (bj + ti) // 2)
+
+        lim_l = min(lim_l, li)
+        lim_r = max(lim_r, ri_x)
+        lim_t = min(lim_t, ti)
+        lim_b = max(lim_b, bi)
+
+        text_area = max(1, (ri_x - li) * (bi - ti))
+        lim_area = max(1, (lim_r - lim_l) * (lim_b - lim_t))
+        cov = min(1.0, text_area / lim_area)
+        exp = min(0.85, max(0.0, (0.75 - cov) * 1.5))
+
+        new_l = max(lim_l, li - int((li - lim_l) * exp))
+        new_r = min(lim_r, ri_x + int((lim_r - ri_x) * exp))
+        new_t = max(lim_t, ti - int((ti - lim_t) * exp))
+        new_b = min(lim_b, bi + int((lim_b - bi) * exp))
+        expanded_bounds.append((new_l, new_t, new_r, new_b))
+
+    return expanded_bounds
+
+
 class PillowRenderer(Renderer):
     """Pillow renderer with text wrapping and outline stroke support."""
 
@@ -99,9 +197,13 @@ class PillowRenderer(Renderer):
     def render(self, image: Image.Image, regions: list[TextRegion]) -> Image.Image:
         image = image.copy()
         draw = ImageDraw.Draw(image)
-        for region in regions:
-            if region.translated_text:
-                self._render_region(draw, region)
+        active_regions = [r for r in regions if r.translated_text]
+        if not active_regions:
+            return image
+
+        bounds_list = compute_non_overlapping_render_bounds(active_regions)
+        for region, bounds in zip(active_regions, bounds_list):
+            self._render_region(draw, region, render_bounds=bounds)
         return image
 
     def _text_color(self, region: TextRegion) -> tuple[int, int, int]:
@@ -114,11 +216,16 @@ class PillowRenderer(Renderer):
             return (int(ink[0]), int(ink[1]), int(ink[2]))
         return (0, 0, 0)
 
-    def _render_region(self, draw: ImageDraw.ImageDraw, region: TextRegion) -> None:
+    def _render_region(
+        self,
+        draw: ImageDraw.ImageDraw,
+        region: TextRegion,
+        render_bounds: tuple[int, int, int, int] | None = None,
+    ) -> None:
         if self._text_direction == "vertical-rtl":
-            self._render_vertical_region(draw, region)
+            self._render_vertical_region(draw, region, render_bounds=render_bounds)
             return
-        left, top, right, bottom = _expand_bbox_towards_layout(region.bbox, region.layout_bbox)
+        left, top, right, bottom = render_bounds if render_bounds is not None else _expand_bbox_towards_layout(region.bbox, region.layout_bbox)
         available_width = max(1, right - left - self._padding * 2)
         available_height = max(1, bottom - top - self._padding * 2)
 
@@ -146,8 +253,13 @@ class PillowRenderer(Renderer):
             _draw_text_with_stroke(draw, pos, text, font, fill, is_multiline=True)
             return
 
-    def _render_vertical_region(self, draw: ImageDraw.ImageDraw, region: TextRegion) -> None:
-        left, top, right, bottom = _expand_bbox_towards_layout(region.bbox, region.layout_bbox)
+    def _render_vertical_region(
+        self,
+        draw: ImageDraw.ImageDraw,
+        region: TextRegion,
+        render_bounds: tuple[int, int, int, int] | None = None,
+    ) -> None:
+        left, top, right, bottom = render_bounds if render_bounds is not None else _expand_bbox_towards_layout(region.bbox, region.layout_bbox)
         available_width = max(1, right - left - self._padding * 2)
         available_height = max(1, bottom - top - self._padding * 2)
         vertical_text = to_vertical_text(region.translated_text or "")
@@ -186,17 +298,16 @@ def _draw_text_with_stroke(
     font: ImageFont.FreeTypeFont,
     fill: tuple[int, int, int],
     is_multiline: bool = False,
-    spacing: float = 0,
+    spacing: int = 0,
     align: str = "center",
 ) -> None:
     """Two-pass text rendering: draws outer stroke first, then draws inner font body on top."""
-    sw, sf = _stroke_info(fill, font.size)
-    if sw > 0:
+    stroke_width, stroke_fill = _stroke_info(fill, font.size)
+    if stroke_width > 0:
         if is_multiline:
-            draw.multiline_text(xy, text, font=font, fill=sf, spacing=spacing, align=align, stroke_width=sw, stroke_fill=sf)
+            draw.multiline_text(xy, text, font=font, fill=fill, spacing=spacing, align=align, stroke_width=stroke_width, stroke_fill=stroke_fill)
         else:
-            draw.text(xy, text, font=font, fill=sf, stroke_width=sw, stroke_fill=sf)
-    # Pass 2: Crisp inner body fill drawn on top with stroke_width=0
+            draw.text(xy, text, font=font, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill)
     if is_multiline:
         draw.multiline_text(xy, text, font=font, fill=fill, spacing=spacing, align=align, stroke_width=0)
     else:
@@ -220,42 +331,37 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFon
 
 
 class MaskAwarePillowRenderer(PillowRenderer):
-    def _render_region(self, draw: ImageDraw.ImageDraw, region: TextRegion) -> None:
+    def _render_region(
+        self,
+        draw: ImageDraw.ImageDraw,
+        region: TextRegion,
+        render_bounds: tuple[int, int, int, int] | None = None,
+    ) -> None:
         if not isinstance(region.layout_mask, np.ndarray) or region.layout_bbox is None:
-            super()._render_region(draw, region)
+            super()._render_region(draw, region, render_bounds=render_bounds)
             return
 
         mask = region.layout_mask.astype(np.uint8)
         layout_left, layout_top, _, _ = region.layout_bbox
-        text_left, text_top, text_right, text_bottom = region.bbox
-        left = max(0, text_left - layout_left)
-        top = max(0, text_top - layout_top)
-        right = min(mask.shape[1], text_right - layout_left)
-        bottom = min(mask.shape[0], text_bottom - layout_top)
-        if right <= left or bottom <= top:
-            super()._render_region(draw, region)
-            return
 
-        # Adaptive expansion: when the original text box occupies only a small fraction
-        # of the speech bubble segmentation mask, expand the allowed area outward
-        # into the bubble to give translated text ample room for comfortable legibility.
-        bx, by, bw, bh = cv2.boundingRect(mask)
-        bubble_area = float(np.count_nonzero(mask))
-        text_area = float((right - left) * (bottom - top))
-        if bubble_area > 0:
-            coverage_ratio = min(1.0, text_area / bubble_area)
-            expand_ratio = min(0.85, max(0.0, (0.75 - coverage_ratio) * 1.5))
-            if expand_ratio > 0:
-                left = max(bx, left - int((left - bx) * expand_ratio))
-                right = min(bx + bw, right + int(((bx + bw) - right) * expand_ratio))
-                top = max(by, top - int((top - by) * expand_ratio))
-                bottom = min(by + bh, bottom + int(((by + bh) - bottom) * expand_ratio))
+        if render_bounds is not None:
+            target_left, target_top, target_right, target_bottom = render_bounds
+        else:
+            target_left, target_top, target_right, target_bottom = _expand_bbox_towards_layout(region.bbox, region.layout_bbox)
+
+        left = max(0, target_left - layout_left)
+        top = max(0, target_top - layout_top)
+        right = min(mask.shape[1], target_right - layout_left)
+        bottom = min(mask.shape[0], target_bottom - layout_top)
+        if right <= left or bottom <= top:
+            super()._render_region(draw, region, render_bounds=render_bounds)
+            return
 
         allowed = np.zeros_like(mask)
         allowed[top:bottom, left:right] = 1
         mask = np.logical_and(mask, allowed).astype(np.uint8)
         if not np.any(mask):
-            super()._render_region(draw, region)
+            super()._render_region(draw, region, render_bounds=render_bounds)
             return
         x, y, width, height = cv2.boundingRect(mask)
         mask = mask[y : y + height, x : x + width]

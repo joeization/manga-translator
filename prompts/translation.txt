@@ -6,3 +6,4 @@ Rules:
 * Lexical Nuance: Retain slang, vulgarity, repetitions, incomplete sentences, and unusual phrasing naturally in the target language. Preserve proper nouns.
 * Context & OCR: Use the provided context to resolve obvious OCR errors or ambiguity, but never invent meaning if it remains uncertain.
 * Sounds & Symbols: Translate clear onomatopoeia/sound effects; otherwise, preserve or transliterate them. Keep all original symbols, punctuation, and formatting.
+* Line Alignment: When translating multiple lines, output EXACTLY one translated line per input line. Maintain the exact same line count and order. NEVER merge adjacent lines, and NEVER split a translation across multiple lines.

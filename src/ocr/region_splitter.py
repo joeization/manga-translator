@@ -296,6 +296,33 @@ def resolve_overlapping_regions(regions: list[TextRegion], threshold: float = 1.
             base = max(members, key=lambda m: regions[m].detection_confidence)
             result.append(replace(regions[base], bbox=(ml, mt, mr, mb)))
 
+    # Final pass: strictly guarantee zero spatial overlap among all returned regions
+    for i in range(len(result)):
+        for j in range(i + 1, len(result)):
+            l1, t1, r1, b1 = result[i].bbox
+            l2, t2, r2, b2 = result[j].bbox
+            inter_w = max(0, min(r1, r2) - max(l1, l2))
+            inter_h = max(0, min(b1, b2) - max(t1, t2))
+            if inter_w > 0 and inter_h > 0:
+                v_overlap = max(0, min(b1, b2) - max(t1, t2))
+                h_overlap = max(0, min(r1, r2) - max(l1, l2))
+                if v_overlap >= h_overlap:
+                    x_sep = (max(l1, l2) + min(r1, r2)) // 2
+                    if (l1 + r1) <= (l2 + r2):
+                        result[i] = replace(result[i], bbox=(l1, t1, min(r1, x_sep), b1))
+                        result[j] = replace(result[j], bbox=(max(l2, x_sep), t2, r2, b2))
+                    else:
+                        result[i] = replace(result[i], bbox=(max(l1, x_sep), t1, r1, b1))
+                        result[j] = replace(result[j], bbox=(l2, t2, min(r2, x_sep), b2))
+                else:
+                    y_sep = (max(t1, t2) + min(b1, b2)) // 2
+                    if (t1 + b1) <= (t2 + b2):
+                        result[i] = replace(result[i], bbox=(l1, t1, r1, min(b1, y_sep)))
+                        result[j] = replace(result[j], bbox=(l2, max(t2, y_sep), r2, b2))
+                    else:
+                        result[i] = replace(result[i], bbox=(l1, max(t1, y_sep), r1, b1))
+                        result[j] = replace(result[j], bbox=(l2, t2, r2, min(b2, y_sep)))
+
     return result
 
 
