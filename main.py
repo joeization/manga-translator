@@ -17,6 +17,7 @@ from typing import Callable
 
 from PIL import Image
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from src.config import Settings
 from src.inpainting import NoopInpainter, OpenCVInpainter
@@ -121,7 +122,6 @@ def parse_arguments() -> argparse.Namespace:
             raise RuntimeError("No file, ZIP archive, or directory was selected.")
         args.file = file_path
         args.dir = dir_path
-        args.show = True
 
     return args
 
@@ -398,13 +398,20 @@ def main() -> int:
                     failures[0] += 1
                     logging.exception("Failed to process %s\nStage: setup\nReason: %s", item.name, error)
 
+        def run_processing() -> None:
+            if not arguments.debug:
+                with logging_redirect_tqdm():
+                    process_paths()
+            else:
+                process_paths()
+
         if arguments.show:
-            worker = Thread(target=process_paths, daemon=True)
+            worker = Thread(target=run_processing, daemon=True)
             worker.start()
             ImageViewer().show_stream(images, cancel_event)
             worker.join()
             return 1 if failures[0] else 0
-        process_paths()
+        run_processing()
         return 1 if failures[0] else 0
     except Exception as error:
         logging.exception("Failed to initialize processing\nStage: setup\nReason: %s", error)
