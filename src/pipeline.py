@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw
 
 from src.inpainting import Inpainter
 from src.models import OCRResult
+from src.ocr.postprocess import sort_manga_reading_order
 from src.renderer import Renderer, TextAnchorDetector
 from src.translator import OllamaCorrector, Translator
 
@@ -344,6 +345,9 @@ def _translation_candidates(
     weight_mean: float = 0.5,
     weight_std: float = 0.80,
 ) -> list[OCRResult]:
+    # Sort into manga reading order (right-to-left, top-to-bottom) before passing context to the LLM.
+    # This ensures the corrector and translator see dialogue in the correct narrative sequence.
+    regions = sort_manga_reading_order(regions)  # type: ignore[arg-type]
     candidates: list[OCRResult] = []
     for region in regions:
         score = compute_ocr_quality_score(

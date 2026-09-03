@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import cv2
@@ -9,6 +10,7 @@ from src.models import TextRegion
 
 from .region_splitter import resolve_overlapping_regions
 
+logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class BubblePostprocessConfig:
@@ -120,7 +122,57 @@ def postprocess_bubbles(
         )
 
     results.extend(segmentation for index, segmentation in enumerate(segmentation_bubbles) if index not in matched_segmentation)
-    return resolve_overlapping_regions(results, threshold=0.35)
+    results = resolve_overlapping_regions(results, threshold=0.35)
+    return _suppress_furigana(results)
+
+
+def _suppress_furigana(regions: list[TextRegion]) -> list[TextRegion]:
+    """Suppress furigana / ruby text annotations.
+
+    A region is classified as furigana if:
+      - Its height is less than 40% of a vertically-adjacent neighbour's height, AND
+      - It horizontally overlaps that neighbour by at least 50% of its own width, AND
+      - Its vertical gap to the neighbour is small (< 0.5× its own height).
+
+    Furigana regions are common in Japanese manga (small kana printed above kanji) and
+    are detected as separate YOLO boxes that would OCR as noise.
+    """
+    if len(regions) < 2:
+        return regions
+
+    furigana_indices: set[int] = set()
+    for i, cand in enumerate(regions):
+        cl, ct, cr, cb = cand.bbox
+        ch = cb - ct
+        cw = cr - cl
+        if ch <= 0 or cw <= 0:
+            continue
+        for j, neighbour in enumerate(regions):
+            if i == j:
+                continue
+            nl, nt, nr, nb = neighbour.bbox
+            nh = nb - nt
+            if nh <= 0:
+                continue
+            # Must be significantly smaller in height
+            if ch >= nh * 0.40:
+                continue
+            # Must be positioned directly above the neighbour (or slightly below)
+            vertical_gap = nt - cb  # positive = cand is above neighbour
+            if not (-ch * 0.5 <= vertical_gap <= ch * 0.5):
+                continue
+            # Must overlap horizontally by >= 50% of candidate width
+            horiz_overlap = max(0, min(cr, nr) - max(cl, nl))
+            if horiz_overlap < cw * 0.5:
+                continue
+            furigana_indices.add(i)
+            break
+
+    if furigana_indices:
+        kept = [r for i, r in enumerate(regions) if i not in furigana_indices]
+        logger.debug("Furigana suppression removed %d small annotation regions", len(furigana_indices))
+        return kept
+    return regions
 
 
 def sort_manga_reading_order(regions: list[TextRegion]) -> list[TextRegion]:
