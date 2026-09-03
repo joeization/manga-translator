@@ -136,6 +136,8 @@ def _suppress_furigana(regions: list[TextRegion]) -> list[TextRegion]:
 
     Furigana regions are common in Japanese manga (small kana printed above kanji) and
     are detected as separate YOLO boxes that would OCR as noise.
+    Ruby text / furigana annotations (small phonetic guides printed adjacent to base ideographs)
+    are often detected as separate YOLO boxes that would OCR as noise.
     """
     if len(regions) < 2:
         return regions
@@ -177,6 +179,7 @@ def _suppress_furigana(regions: list[TextRegion]) -> list[TextRegion]:
 
 def sort_manga_reading_order(regions: list[TextRegion]) -> list[TextRegion]:
     """Sort regions in Japanese manga reading order: Top-to-Bottom, Right-to-Left."""
+    """Sort regions in vertical-RTL reading order: Top-to-Bottom, Right-to-Left."""
     if not regions:
         return []
     sorted_by_top = sorted(regions, key=lambda region: region.bbox[1])

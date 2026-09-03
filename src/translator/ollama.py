@@ -69,6 +69,7 @@ def format_response(text: str) -> str:
         ret = re.sub(r"[-—―ー]{2,}", "—", ret)
         ret = re.sub(r"[~～]{2,}", "~", ret)
         # Remove redundant whitespace between adjacent CJK characters while preserving Latin spaces and newlines
+        # Remove redundant horizontal whitespace between adjacent ideographs while preserving inter-word spacing and newlines
         ret = re.sub(r"(?<=[\u4e00-\u9fff\u3040-\u30ff])[ \t\u3000]+(?=[\u4e00-\u9fff\u3040-\u30ff])", "", ret)
     return ret
 

@@ -19,9 +19,17 @@ class BreakPriority(IntEnum):
 
 
 SENTENCE_TERMINALS = set("。！？!?…︙⋯‥⋮")
-CLAUSE_TERMINALS = set("，、；;：:—～~")
-CLOSING_PUNCTUATION = set("」』”’）)】〕》〉")
-OPENING_PUNCTUATION = set("「『“‘（(【〔《〈")
+CLAUSE_TERMINALS = set("，、；;：:—～~︱︲︴")
+CLOSING_PUNCTUATION = set("」』”’）)]}〕》〉﹂﹄︶︸︺︼︾﹀﹈")
+OPENING_PUNCTUATION = set("「『“‘（([{〔《〈﹁﹃︵︷︹︻︽︿﹇")
+
+# Universal Kinsoku Shori rules (JIS X 4051 / W3C Requirements for Chinese & Japanese Text Layout)
+# Universal Kinsoku Shori line-breaking rules (W3C / international standards for East Asian typography)
+LINE_START_PROHIBITED = CLOSING_PUNCTUATION | SENTENCE_TERMINALS | set(
+    "，、；;：:,.…︙︱︲︴—―-~～ーｰぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮ"
+)
+LINE_END_PROHIBITED = OPENING_PUNCTUATION
+
 
 
 @dataclass(frozen=True)
@@ -260,19 +268,9 @@ class TextAutoLayout:
         return total
 
     def _measure_vertical_length(self, text: str, font_size: int) -> float:
-        """Measure vertical length of column (in vertical text, each CJK character advances vertically)."""
+        """Measure vertical length of column. Matches rendering advance where each character advances by font_size."""
         chars = [c for c in text if c != "\n"]
-        total = 0.0
-        for ch in chars:
-            if ch in "，、。；！？":
-                total += font_size * 0.75
-            elif ch in "…—":
-                total += font_size * 0.85
-            elif ord(ch) < 128:
-                total += font_size * 0.55
-            else:
-                total += font_size
-        return total
+        return float(len(chars) * font_size)
 
     def _layout_horizontal(
         self,
@@ -486,18 +484,36 @@ class TextAutoLayout:
         num_chunks = max(2, math.ceil(total_len / line_limit))
         chars = list(text)
         total_chars = len(chars)
+
+        # In vertical layout, never split short phrases (<= 3 chars) across multiple columns
+        if self.orientation == "vertical-rtl":
+            if total_chars <= 3 or (total_chars / num_chunks) < 1.5:
+                return [text]
+
         target_chunk_len = total_chars / num_chunks
 
         chunks: list[str] = []
         cur_idx = 0
         for i in range(num_chunks):
             next_idx = round((i + 1) * target_chunk_len) if i < num_chunks - 1 else total_chars
+            # Apply Kinsoku Shori (JIS X 4051 / W3C text layout):
+            # 1. Line-start prohibition: next line should not start with a prohibited character
+            while next_idx < total_chars and chars[next_idx] in LINE_START_PROHIBITED:
+                next_idx += 1
+            # 2. Line-end prohibition: current line should not end with an opening bracket
+            while next_idx > cur_idx + 1 and chars[next_idx - 1] in LINE_END_PROHIBITED:
+                next_idx -= 1
+
             chunk = "".join(chars[cur_idx:next_idx])
             while len(chunk) > 1 and measure_func(chunk) > line_limit:
                 next_idx -= 1
+                while next_idx > cur_idx + 1 and chars[next_idx - 1] in LINE_END_PROHIBITED:
+                    next_idx -= 1
                 chunk = "".join(chars[cur_idx:next_idx])
             chunks.append(chunk)
             cur_idx = next_idx
+            if cur_idx >= total_chars:
+                break
 
         if cur_idx < total_chars:
             chunks.append("".join(chars[cur_idx:]))
@@ -566,6 +582,15 @@ class TextAutoLayout:
             return -100000.0 - (overflow_w + overflow_h) * 100.0
 
         score = 0.0
+
+        # In vertical typography, short phrases (<= 3 chars, e.g. "当然", "好的") must NEVER be split
+        # into multiple 1-character columns (which turns vertical text into backward horizontal RTL "然 当").
+        col_lens = [len(c.text) for c in columns]
+        if len(columns) >= 2:
+            if max(col_lens) <= 1 or sum(col_lens) <= 3:
+                return -100000.0
+            if min(col_lens) == 1:
+                score -= 300.0
 
         # Font size preference
         score += font_size * 25.0

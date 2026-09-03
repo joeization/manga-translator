@@ -42,6 +42,7 @@ VERTICAL_PUNCTUATION_MAP = {
     "\u2014": "\ufe31",  # — -> ︱
     "-": "\ufe31",       # - -> ︱
     "ー": "︱",          # U+30FC Katakana-Hiragana prolonged sound mark -> ︱
+    "ー": "︱",          # U+30FC Prolonged sound mark -> ︱
     "ｰ": "︱",          # U+FF70 Halfwidth prolonged sound mark -> ︱
     "|": "︱",          # U+007C ASCII pipe / vertical bar -> ︱
     "｜": "︱",         # U+FF5C Fullwidth vertical line -> ︱
@@ -223,6 +224,15 @@ class PillowRenderer(Renderer):
     ) -> bool:
         """Check if region is a horizontal rectangle that should be rendered left-to-right, top-to-bottom."""
         if self._text_direction == "horizontal":
+            return True
+
+        # General script detection: Alphabetic/phonetic scripts (Latin, Cyrillic, Greek) without CJK characters
+        # General script detection: Alphabetic and phonetic scripts without ideographs
+        # are inherently horizontal and should never be rendered vertically letter-by-letter.
+        text = region.translated_text or ""
+        has_cjk = bool(re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text))
+        has_alpha = bool(re.search(r"[a-zA-Z\u00C0-\u024F\u0400-\u04FF]", text))
+        if has_alpha and not has_cjk:
             return True
 
         bl, bt, br, bb = region.bbox

@@ -1,6 +1,6 @@
 # Manga Translator
 
-Local CLI & GUI tool that detects manga text, runs OCR and translation via Ollama, erases original text using LaMa neural GPU or OpenCV inpainting, and renders translated text with automatic stroke outlines.
+Local CLI & GUI tool that detects manga text, runs OCR and translation via Ollama, erases original text using LaMa neural GPU or OpenCV inpainting, and renders translated text with automatic stroke outlines and intelligent typography auto-layout.
 
 ## Prerequisites
 
@@ -21,6 +21,7 @@ Local CLI & GUI tool that detects manga text, runs OCR and translation via Ollam
 
    ```powershell
    ollama pull Sakura-Galtransl-7B-v3.7
+   ollama pull <translation-model>
    ```
 
 4. Create local configuration file:
