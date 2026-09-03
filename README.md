@@ -80,19 +80,21 @@ python main.py --file path/to/page.jpg --debug
 
 ## Configuration
 
-All runtime settings are configured in `.env`:
+All runtime settings are configured in `.env` (copy from `.env.example`):
 
 - **Translation**: `OLLAMA_HOST`, `OLLAMA_MODEL`, `SOURCE_LANGUAGE`, `TARGET_LANGUAGE`, `TRANSLATION_PROMPT_FILE`, `CORRECTION_PROMPT_FILE`.
 - **Output**: `OUTPUT_DIR`, `OUTPUT_FORMAT`, `OUTPUT_JPEG_QUALITY`.
-- **Rendering**: `FONT_PATH`, `FONT_SIZE`, `MAX_FONT_SIZE`, `MIN_FONT_SIZE`, `TEXT_PADDING`, `RENDERER_ENGINE`, `TEXT_DIRECTION`, `TEXT_ANCHOR_ENGINE`, `TEXT_ANCHOR_BORDER_MARGIN`.
-- **OCR**: `OCR_ENGINE` (`baberu` / `manga-ocr`), `OCR_MODEL_DIR`, `OCR_MIN_TRANSLATION_CONFIDENCE`.
+- **Rendering**: `FONT_PATH`, `FONT_SIZE`, `MAX_FONT_SIZE`, `MIN_FONT_SIZE`, `TEXT_PADDING`, `RENDERER_ENGINE`, `TEXT_DIRECTION`, `TEXT_ANCHOR_ENGINE`.
+- **OCR**: `OCR_ENGINE` (`baberu` / `manga-ocr`), `OCR_MODEL_DIR`, `OCR_MIN_TRANSLATION_CONFIDENCE` — minimum combined quality score [0–1] to allow translation (default `0.65`).
 - **Region Detection**: `PIPELINE_MODE` (`hybrid` / `two-stage` / `one-stage`), `YOLO_MODEL_PATH`, `YOLO_CONFIDENCE`, `BUBBLE_MODEL_PATH`, `BUBBLE_CONFIDENCE`.
 - **Inpainting**:
   - `INPAINT_ENABLED`: `true` / `false`.
-  - `INPAINT_ENGINE`: `lama` (ONNX GPU) or `opencv` (Telea/NS).
-  - `LAMA_MODEL_PATH`: Path to LaMa ONNX model (e.g. `models/inpainting_lama/lama-manga.onnx`).
-  - `LAMA_DEVICE`: `gpu` / `cuda` / `cpu`.
-  - OpenCV & bubble parameters: `TEXT_DARK_THRESHOLD`, `WHITE_BACKGROUND_THRESHOLD`, `WHITE_BACKGROUND_RATIO`, `INPAINT_RADIUS`, `MASK_DILATION`, `OCR_CLEAR_PADDING`, `BUBBLE_PADDING`, `BUBBLE_CLOSE_KERNEL`, `BUBBLE_CLEAR_MODE`, `BUBBLE_MIN_OVERLAP`, `BUBBLE_BORDER_WIDTH`, `TEXT_BRIGHT_THRESHOLD`, `SOLID_FILL_STD_THRESHOLD`, `INPAINT_ALGORITHM`.
+  - `INPAINT_ENGINE`: `lama` (ONNX GPU, recommended) or `opencv` (CPU fallback).
+  - `BUBBLE_CLEAR_MODE`: `interior` (erase entire bubble, fastest) or `glyph` (detect individual strokes, better for gradient/coloured backgrounds).
+  - `LAMA_MODEL_PATH`: Path to LaMa ONNX model (default `models/inpainting_lama/lama-manga.onnx`).
+  - `LAMA_DEVICE`: `gpu` / `cpu`.
+
+> All internal inpainting thresholds (dark threshold, bubble padding, mask dilation, etc.) are automatically determined and do not need configuration.
 
 ## License & Example Content
 

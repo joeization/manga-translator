@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 
 from src.models import TextRegion
@@ -17,9 +18,54 @@ class BubblePostprocessConfig:
     long_strip_aspect_ratio: float = 3.0
     long_strip_cross_axis_overlap: float = 0.9
     long_strip_gap_ratio: float = 0.0
+    mask_erosion_kernel_size: int = 3
+    mask_erosion_iterations: int = 1
 
 
 DEFAULT_CONFIG = BubblePostprocessConfig()
+
+
+def postprocess_segmentation_mask(
+    mask: np.ndarray,
+    layout_bbox: tuple[int, int, int, int],
+    detection_box: tuple[int, int, int, int],
+    kernel_size: int = 3,
+    iterations: int = 1,
+    protect_margin: int = 4,
+) -> np.ndarray:
+    """Post-process segmentation mask by eroding outside the detection box while preserving the inside exactly as-is.
+
+    The resulting behavior is:
+        final_mask = eroded_mask outside (box + protect_margin)
+                     original_mask inside (box + protect_margin)
+    """
+    if not isinstance(mask, np.ndarray) or not np.any(mask) or kernel_size <= 1 or iterations <= 0:
+        return mask
+
+    # 1. Save original segmentation mask
+    original_mask = mask.astype(bool)
+
+    # 2. Apply a gentle morphological cross erosion to the entire mask once
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (kernel_size, kernel_size))
+    eroded = cv2.erode(original_mask.astype(np.uint8), kernel, iterations=iterations).astype(bool)
+    eroded_mask = eroded if np.any(eroded) else original_mask
+
+    # 3. Restore original mask pixels inside the detection box plus outward margin
+    # This ensures original text outward strokes / outlines (原字的外擴) are never eroded.
+    sl, st, sr, sb = layout_bbox
+    dl, dt, dr, db = detection_box
+
+    ol, ot = max(sl, dl - protect_margin), max(st, dt - protect_margin)
+    or_, ob = min(sr, dr + protect_margin), min(sb, db + protect_margin)
+
+    # 4. Use the eroded result only outside the protected zone
+    final_mask = eroded_mask.copy()
+    if or_ > ol and ob > ot:
+        box_l, box_t = ol - sl, ot - st
+        box_r, box_b = or_ - sl, ob - st
+        final_mask[box_t:box_b, box_l:box_r] = original_mask[box_t:box_b, box_l:box_r]
+
+    return final_mask
 
 
 def postprocess_bubbles(
@@ -46,6 +92,22 @@ def postprocess_bubbles(
         matched_segmentation.add(segmentation_index)
         segmentation = segmentation_bubbles[segmentation_index]
         yolo = _merge_bboxes([yolo_bubbles[index] for index in yolo_indices])
+
+        layout_mask = segmentation.layout_mask
+        if (
+            isinstance(segmentation.layout_mask, np.ndarray)
+            and segmentation.layout_bbox is not None
+            and config.mask_erosion_kernel_size > 1
+            and config.mask_erosion_iterations > 0
+        ):
+            layout_mask = postprocess_segmentation_mask(
+                segmentation.layout_mask,
+                segmentation.layout_bbox,
+                yolo.bbox,
+                kernel_size=config.mask_erosion_kernel_size,
+                iterations=config.mask_erosion_iterations,
+            )
+
         results.append(
             TextRegion(
                 bbox=yolo.bbox,
@@ -53,7 +115,7 @@ def postprocess_bubbles(
                 detection_confidence=max(yolo.detection_confidence, segmentation.detection_confidence),
                 source_bbox=yolo.bbox,
                 layout_bbox=segmentation.layout_bbox,
-                layout_mask=segmentation.layout_mask,
+                layout_mask=layout_mask,
             )
         )
 

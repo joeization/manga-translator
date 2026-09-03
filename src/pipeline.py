@@ -368,17 +368,41 @@ def _translation_candidates(
 
 
 def draw_debug_image(image: Image.Image, regions: list[OCRResult]) -> Image.Image:
-    debug_image = image.copy()
+    debug_image = image.convert("RGB")
+    w, h = debug_image.size
+    overlay_pixels = np.zeros((h, w, 4), dtype=np.uint8)
+
+    # 1. Accumulate semi-transparent mask overlays
+    for region in regions:
+        # Red semi-transparent fill for segmentation bubble
+        if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
+            left, top, right, bottom = region.layout_bbox
+            cl, ct = max(0, left), max(0, top)
+            cr, cb = min(w, right), min(h, bottom)
+            if cr > cl and cb > ct:
+                src = region.layout_mask[ct - top : cb - top, cl - left : cr - left]
+                overlay_pixels[ct:cb, cl:cr][src] = (255, 0, 0, 64)
+
+        # Yellow semi-transparent fill for inpaint mask
+        if isinstance(region.inpaint_mask, np.ndarray) and region.inpaint_bbox is not None:
+            left, top, right, bottom = region.inpaint_bbox
+            cl, ct = max(0, left), max(0, top)
+            cr, cb = min(w, right), min(h, bottom)
+            if cr > cl and cb > ct:
+                src = region.inpaint_mask[ct - top : cb - top, cl - left : cr - left]
+                overlay_pixels[ct:cb, cl:cr][src] = (255, 255, 0, 120)
+
+    # 2. Single alpha-composite for the entire page
+    if np.any(overlay_pixels[:, :, 3] > 0):
+        overlay_img = Image.fromarray(overlay_pixels, mode="RGBA")
+        debug_image = Image.alpha_composite(debug_image.convert("RGBA"), overlay_img).convert("RGB")
+
+    # 3. Draw sharp contour outlines and bounding boxes on top
     draw = ImageDraw.Draw(debug_image)
     for region in regions:
         draw.rectangle(region.bbox, outline="blue", width=3)
         if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
-            left, top, right, bottom = region.layout_bbox
-            segmentation_overlay = Image.new("RGBA", debug_image.size, (0, 0, 0, 0))
-            segmentation_pixels = np.asarray(segmentation_overlay).copy()
-            segmentation_pixels[top:bottom, left:right][region.layout_mask] = (255, 0, 0, 64)
-            debug_image = Image.alpha_composite(debug_image.convert("RGBA"), Image.fromarray(segmentation_pixels, mode="RGBA")).convert("RGB")
-            draw = ImageDraw.Draw(debug_image)
+            left, top, _, _ = region.layout_bbox
             contours, _ = cv2.findContours(region.layout_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for contour in contours:
                 points = [(left + int(point[0][0]), top + int(point[0][1])) for point in contour]
@@ -388,14 +412,7 @@ def draw_debug_image(image: Image.Image, regions: list[OCRResult]) -> Image.Imag
             left, top, right, bottom = region.bbox
             inset = 4
             draw.rectangle((left + inset, top + inset, right - inset, bottom - inset), outline="red", width=2)
-        if isinstance(region.inpaint_mask, np.ndarray) and region.inpaint_bbox is not None:
-            left, top, _, _ = region.inpaint_bbox
-            overlay = Image.new("RGBA", debug_image.size, (0, 0, 0, 0))
-            overlay_pixels = np.asarray(overlay).copy()
-            mask = region.inpaint_mask
-            overlay_pixels[top : top + mask.shape[0], left : left + mask.shape[1]][mask] = (255, 255, 0, 120)
-            debug_image = Image.alpha_composite(debug_image.convert("RGBA"), Image.fromarray(overlay_pixels, mode="RGBA")).convert("RGB")
-            draw = ImageDraw.Draw(debug_image)
+
     return debug_image
 
 

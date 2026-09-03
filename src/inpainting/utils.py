@@ -141,3 +141,25 @@ def estimate_ink_color(
                 return (255, 255, 255)
             return tuple(int(c) for c in np.clip(np.round(ink), 0, 255))
         return (255, 255, 255)
+
+
+def slice_mask_to_roi(
+    roi_bbox: tuple[int, int, int, int],
+    mask_bbox: tuple[int, int, int, int],
+    mask: np.ndarray,
+) -> np.ndarray:
+    """Project a mask positioned at mask_bbox into a local boolean array covering roi_bbox."""
+    rl, rt, rr, rb = roi_bbox
+    bl, bt, br, bb = mask_bbox
+    result = np.zeros((rb - rt, rr - rl), dtype=bool)
+
+    ol, ot = max(rl, bl), max(rt, bt)
+    or_, ob = min(rr, br), min(rb, bb)
+    if or_ <= ol or ob <= ot:
+        return result
+
+    src = mask[ot - bt : ob - bt, ol - bl : or_ - bl]
+    h = min(src.shape[0], ob - ot)
+    w = min(src.shape[1], or_ - ol)
+    result[ot - rt : ot - rt + h, ol - rl : ol - rl + w] = src[:h, :w]
+    return result

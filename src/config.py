@@ -27,7 +27,6 @@ class Settings:
     renderer_engine: str
     text_direction: str
     text_anchor_engine: str
-    text_anchor_border_margin: int
     ocr_engine: str
     ocr_model_dir: Path
     ocr_min_translation_confidence: float
@@ -38,25 +37,9 @@ class Settings:
     bubble_confidence: float
     inpaint_enabled: bool
     inpaint_engine: str
-    text_dark_threshold: int
-    white_background_threshold: int
-    white_background_ratio: float
-    inpaint_radius: int
-    mask_dilation: int
-    ocr_clear_padding: int
-    bubble_padding: int
-    bubble_close_kernel: int
     bubble_clear_mode: str
-    bubble_min_overlap: float
-    bubble_border_width: int
-    text_bright_threshold: int
-    solid_fill_std_threshold: float
-    inpaint_algorithm: str
     lama_model_path: Path | None
     lama_device: str
-    ocr_weight_sentence: float = 0.5
-    ocr_weight_mean: float = 0.5
-    ocr_weight_std: float = 0.80
 
     @classmethod
     def load(cls, project_root: Path) -> "Settings":
@@ -81,13 +64,9 @@ class Settings:
             renderer_engine=_required_setting("RENDERER_ENGINE").lower(),
             text_direction=_required_setting("TEXT_DIRECTION").lower(),
             text_anchor_engine=_required_setting("TEXT_ANCHOR_ENGINE").lower(),
-            text_anchor_border_margin=int(_required_setting("TEXT_ANCHOR_BORDER_MARGIN")),
             ocr_engine=_optional_setting("OCR_ENGINE", "manga-ocr").lower(),
             ocr_model_dir=_project_path(project_root, _required_setting("OCR_MODEL_DIR")),
-            ocr_min_translation_confidence=_confidence_setting("OCR_MIN_TRANSLATION_CONFIDENCE", 0.75),
-            ocr_weight_sentence=float(_optional_setting("OCR_WEIGHT_SENTENCE", "0.5")),
-            ocr_weight_mean=float(_optional_setting("OCR_WEIGHT_MEAN", "0.5")),
-            ocr_weight_std=float(_optional_setting("OCR_WEIGHT_STD", "0.80")),
+            ocr_min_translation_confidence=_confidence_setting("OCR_MIN_TRANSLATION_CONFIDENCE", 0.65),
             pipeline_mode=_required_setting("PIPELINE_MODE").lower(),
             yolo_model_path=_project_path(project_root, _required_setting("YOLO_MODEL_PATH")),
             yolo_confidence=float(_required_setting("YOLO_CONFIDENCE")),
@@ -95,20 +74,7 @@ class Settings:
             bubble_confidence=float(_required_setting("BUBBLE_CONFIDENCE")),
             inpaint_enabled=_required_setting("INPAINT_ENABLED").lower() == "true",
             inpaint_engine=_required_setting("INPAINT_ENGINE").lower(),
-            text_dark_threshold=int(_required_setting("TEXT_DARK_THRESHOLD")),
-            white_background_threshold=int(_required_setting("WHITE_BACKGROUND_THRESHOLD")),
-            white_background_ratio=float(_required_setting("WHITE_BACKGROUND_RATIO")),
-            inpaint_radius=int(_required_setting("INPAINT_RADIUS")),
-            mask_dilation=int(_required_setting("MASK_DILATION")),
-            ocr_clear_padding=int(_required_setting("OCR_CLEAR_PADDING")),
-            bubble_padding=int(_required_setting("BUBBLE_PADDING")),
-            bubble_close_kernel=int(_required_setting("BUBBLE_CLOSE_KERNEL")),
-            bubble_clear_mode=_required_setting("BUBBLE_CLEAR_MODE").lower(),
-            bubble_min_overlap=float(_required_setting("BUBBLE_MIN_OVERLAP")),
-            bubble_border_width=int(_required_setting("BUBBLE_BORDER_WIDTH")),
-            text_bright_threshold=int(_optional_setting("TEXT_BRIGHT_THRESHOLD", "220")),
-            solid_fill_std_threshold=float(_optional_setting("SOLID_FILL_STD_THRESHOLD", "5")),
-            inpaint_algorithm=_optional_setting("INPAINT_ALGORITHM", "telea").lower(),
+            bubble_clear_mode=_optional_setting("BUBBLE_CLEAR_MODE", "interior").lower(),
             lama_model_path=_project_path(project_root, _optional_setting("LAMA_MODEL_PATH", "models/inpainting_lama/lama-manga.onnx")),
             lama_device=_optional_setting("LAMA_DEVICE", "gpu").lower(),
         )

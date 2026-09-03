@@ -30,7 +30,7 @@ from src.models import TextRegion
 
 from .base import Inpainter
 from .bubble import OpenCVContourBubbleSegmenter
-from .utils import estimate_adaptive_dilation
+from .utils import estimate_adaptive_dilation, slice_mask_to_roi
 # Minimum background sample size before we trust the colour estimate.
 _MIN_BG_SAMPLES: int = 16
 # Hard floor on the colour-distance contrast threshold.
@@ -116,19 +116,25 @@ class OpenCVInpainter(Inpainter):
 
         # Bubble segmentation mask in ROI coordinates, eroded to protect the bubble border.
         bubble_mask_roi = (
-            _bubble_mask_in_region(roi_bbox, bubble_bbox, bubble_mask)
+            slice_mask_to_roi(roi_bbox, bubble_bbox, bubble_mask)
             if bubble is not None
             else np.ones(roi.shape[:2], dtype=bool)
         )
         if bubble is not None and self._bubble_border_width > 0:
             ks = self._bubble_border_width * 2 + 1
-            k_border = np.ones((ks, ks), dtype=np.uint8)
+            k_border = cv2.getStructuringElement(cv2.MORPH_CROSS, (ks, ks))
             eroded_bubble = cv2.erode(bubble_mask_roi.astype(np.uint8), k_border, iterations=1).astype(bool)
             if np.any(eroded_bubble):
+                # Preserve bubble mask inside detect_mask plus margin (so outward strokes are preserved)
+                k_exp = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+                expanded_detect = cv2.dilate(detect_mask.astype(np.uint8), k_exp).astype(bool)
+                eroded_bubble[expanded_detect] = bubble_mask_roi[expanded_detect]
                 bubble_mask_roi = eroded_bubble
 
-        # Inpainting target is strictly the INTERSECTION of un-dilated detect rect and segmentation interior!
-        allowed = detect_mask & bubble_mask_roi
+        # Inpainting target allows outward strokes within bubble segmentation
+        k_exp = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        expanded_detect = cv2.dilate(detect_mask.astype(np.uint8), k_exp).astype(bool)
+        allowed = expanded_detect & bubble_mask_roi
 
         bg_samples = _sample_background(roi, bubble_mask_roi, detect_offset)
         bg_color = self._background_color(roi, bubble_mask_roi, bg_samples)
@@ -665,32 +671,6 @@ def _clip_bbox(
 ) -> tuple[int, int, int, int]:
     l, t, r, b = bbox
     return max(0, l), max(0, t), min(iw, r), min(ih, b)
-
-
-def _bubble_mask_in_region(
-    roi_bbox: tuple[int, int, int, int],
-    bubble_bbox: tuple[int, int, int, int],
-    bubble_mask: np.ndarray,
-) -> np.ndarray:
-    rl, rt, rr, rb = roi_bbox
-    bl, bt, br, bb = bubble_bbox
-    result = np.zeros((rb - rt, rr - rl), dtype=bool)
-
-    ol, ot = max(rl, bl), max(rt, bt)
-    or_, ob = min(rr, br), min(rb, bb)
-    if or_ <= ol or ob <= ot:
-        return result
-
-    st, sl = ot - bt, ol - bl
-    sb, sr = ob - bt, or_ - bl
-    tt, tl = ot - rt, ol - rl
-    tb, tr = ob - rt, or_ - rl
-
-    src = bubble_mask[st:sb, sl:sr]
-    h = min(src.shape[0], tb - tt)
-    w = min(src.shape[1], tr - tl)
-    result[tt : tt + h, tl : tl + w] = src[:h, :w]
-    return result
 
 
 # ---------------------------------------------------------------------------

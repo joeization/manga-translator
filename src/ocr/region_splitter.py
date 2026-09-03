@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image
 
 from src.models import TextRegion
+from src.inpainting.utils import slice_mask_to_roi
 
 
 def crop_for_ocr(image: Image.Image, region: TextRegion) -> Image.Image:
@@ -19,24 +20,10 @@ def crop_for_ocr(image: Image.Image, region: TextRegion) -> Image.Image:
 
 
 def _mask_in_region(region: TextRegion) -> np.ndarray:
-    left, top, right, bottom = region.bbox
-    h, w = bottom - top, right - left
     if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
-        mask_left, mask_top, mask_right, mask_bottom = region.layout_bbox
-        mask = np.zeros((h, w), dtype=bool)
-        overlap_left, overlap_top = max(left, mask_left), max(top, mask_top)
-        overlap_right, overlap_bottom = min(right, mask_right), min(bottom, mask_bottom)
-        if overlap_left < overlap_right and overlap_top < overlap_bottom:
-            source = region.layout_mask[
-                overlap_top - mask_top : overlap_bottom - mask_top,
-                overlap_left - mask_left : overlap_right - mask_left,
-            ]
-            mask[
-                overlap_top - top : overlap_bottom - top,
-                overlap_left - left : overlap_right - left,
-            ] = source
-            return mask
-    return np.ones((h, w), dtype=bool)
+        return slice_mask_to_roi(region.bbox, region.layout_bbox, region.layout_mask)
+    left, top, right, bottom = region.bbox
+    return np.ones((bottom - top, right - left), dtype=bool)
 
 
 def _find_blank_bands(projection: np.ndarray, min_gap_length: int, low_threshold: int = 2) -> list[tuple[int, int]]:
@@ -291,12 +278,7 @@ def region_has_text(image_array: np.ndarray, region: TextRegion, min_char_area: 
     gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
 
     if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
-        ml, mt, mr, mb = region.layout_bbox
-        mask = np.zeros((h, w), dtype=bool)
-        ol, ot = max(l, ml), max(t, mt)
-        orr, ob = min(r, mr), min(b, mb)
-        if ol < orr and ot < ob:
-            mask[ot - t : ob - t, ol - l : orr - l] = region.layout_mask[ot - mt : ob - mt, ol - ml : orr - ml]
+        mask = slice_mask_to_roi((l, t, r, b), region.layout_bbox, region.layout_mask)
         # Erode mask to safely ignore the black bubble outline
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
         interior = cv2.erode(mask.astype(np.uint8), k).astype(bool)

@@ -134,25 +134,21 @@ def build_inpainter(settings: Settings):
         return NoopInpainter()
     if settings.inpaint_engine == "opencv":
         logger.info(
-            "Using inpainting engine: opencv (algorithm=%s, mode=%s)",
-            settings.inpaint_algorithm,
+            "Using inpainting engine: opencv (mode=%s)",
             settings.bubble_clear_mode,
         )
         return OpenCVInpainter(
-            settings.text_dark_threshold,
-            settings.white_background_threshold,
-            settings.white_background_ratio,
-            settings.inpaint_radius,
-            settings.mask_dilation,
-            settings.ocr_clear_padding,
-            settings.bubble_padding,
-            settings.bubble_close_kernel,
-            settings.bubble_clear_mode,
-            settings.bubble_min_overlap,
-            settings.bubble_border_width,
-            settings.text_bright_threshold,
-            settings.solid_fill_std_threshold,
-            settings.inpaint_algorithm,
+            dark_threshold=160,
+            white_threshold=235,
+            white_ratio=0.70,
+            inpaint_radius=3,
+            mask_dilation=1,
+            ocr_clear_padding=12,
+            bubble_padding=80,
+            bubble_close_kernel=13,
+            bubble_clear_mode=settings.bubble_clear_mode,
+            bubble_min_overlap=0.25,
+            bubble_border_width=3,
         )
     if settings.inpaint_engine == "lama":
         logger.info("Using inpainting engine: lama (device=%s, model=%s)", settings.lama_device, settings.lama_model_path)
@@ -161,7 +157,7 @@ def build_inpainter(settings: Settings):
         lama_path = settings.lama_model_path
         if lama_path is None:
             raise RuntimeError("LAMA_MODEL_PATH must be set when INPAINT_ENGINE=lama")
-        return LamaInpainter(lama_path, settings.lama_device, mask_dilation=settings.mask_dilation)
+        return LamaInpainter(lama_path, settings.lama_device)
     raise RuntimeError(f"Unsupported INPAINT_ENGINE: {settings.inpaint_engine}")
 
 
@@ -204,7 +200,7 @@ def build_renderer(settings: Settings) -> PillowRenderer:
 def build_anchor_detector(settings: Settings) -> OpenCVInkAnchorDetector:
     if settings.text_anchor_engine != "opencv-ink":
         raise RuntimeError(f"Unsupported TEXT_ANCHOR_ENGINE: {settings.text_anchor_engine}")
-    return OpenCVInkAnchorDetector(settings.text_dark_threshold, settings.text_anchor_border_margin)
+    return OpenCVInkAnchorDetector(dark_threshold=160, border_margin=5)
 
 
 def build_ocr(settings: Settings):
@@ -364,9 +360,6 @@ def main() -> int:
             build_renderer(settings),
             build_anchor_detector(settings),
             settings.ocr_min_translation_confidence,
-            ocr_weight_sentence=settings.ocr_weight_sentence,
-            ocr_weight_mean=settings.ocr_weight_mean,
-            ocr_weight_std=settings.ocr_weight_std,
         )
         images: Queue = Queue()
         failures = [0]

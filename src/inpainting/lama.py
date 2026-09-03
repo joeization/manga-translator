@@ -16,7 +16,7 @@ from PIL import Image
 from src.models import TextRegion
 
 from .base import Inpainter
-from .utils import estimate_adaptive_dilation, estimate_ink_color
+from .utils import estimate_adaptive_dilation, estimate_ink_color, slice_mask_to_roi
 
 logger = logging.getLogger(__name__)
 
@@ -173,32 +173,6 @@ class LamaInpainter(Inpainter):
         return cv2.resize(out_uint8, (patch_w, patch_h), interpolation=cv2.INTER_CUBIC)
 
 
-def _bubble_mask_in_region(
-    roi_bbox: tuple[int, int, int, int],
-    bubble_bbox: tuple[int, int, int, int],
-    bubble_mask: np.ndarray,
-) -> np.ndarray:
-    rl, rt, rr, rb = roi_bbox
-    bl, bt, br, bb = bubble_bbox
-    result = np.zeros((rb - rt, rr - rl), dtype=bool)
-
-    ol, ot = max(rl, bl), max(rt, bt)
-    or_, ob = min(rr, br), min(rb, bb)
-    if or_ <= ol or ob <= ot:
-        return result
-
-    st, sl = ot - bt, ol - bl
-    sb, sr = ob - bt, or_ - bl
-    tt, tl = ot - rt, ol - rl
-    tb, tr = ob - rt, or_ - rl
-
-    src = bubble_mask[st:sb, sl:sr]
-    h = min(src.shape[0], tb - tt)
-    w = min(src.shape[1], tr - tl)
-    result[tt : tt + h, tl : tl + w] = src[:h, :w]
-    return result
-
-
 def _extract_text_glyph_mask(
     img_rgb: np.ndarray,
     region: TextRegion,
@@ -229,17 +203,6 @@ def _extract_text_glyph_mask(
     if roi.size == 0:
         return None, None
 
-    # Compute bubble segmentation mask in ROI local coordinates if available
-    seg_mask: np.ndarray | None = None
-    interior_seg: np.ndarray | None = None
-    if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
-        seg_mask = _bubble_mask_in_region((pl, pt, pr, pb), region.layout_bbox, region.layout_mask)
-        if seg_mask is not None and np.any(seg_mask):
-            # Protect speech bubble border: erode by border margin (3px) so bubble outline is never masked or dilated
-            k_border = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-            eroded = cv2.erode(seg_mask.astype(np.uint8), k_border, iterations=1).astype(bool)
-            interior_seg = eroded if np.any(eroded) else seg_mask
-
     # Detect rect in ROI coordinates
     detect_rect = np.zeros(roi.shape[:2], dtype=bool)
     dt = max(0, rt - pt)
@@ -248,11 +211,18 @@ def _extract_text_glyph_mask(
     dr = min(pr - pl, rr - pl)
     detect_rect[dt:db, dl:dr] = True
 
-    # Strict allowed boundary: MUST be within detect_rect AND within segmentation interior
-    if interior_seg is not None and np.any(interior_seg):
-        allowed_boundary = detect_rect & interior_seg
-    elif seg_mask is not None and np.any(seg_mask):
-        allowed_boundary = detect_rect & seg_mask
+    # Compute bubble segmentation mask in ROI local coordinates if available
+    seg_mask: np.ndarray | None = None
+    if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
+        seg_mask = slice_mask_to_roi((pl, pt, pr, pb), region.layout_bbox, region.layout_mask)
+
+    # Allowed boundary for glyph extraction and dilation:
+    # Inside speech bubble (seg_mask), allow outward stroke extension (外擴) up to expanded_rect.
+    # Without speech bubble (open scenes / background art), strictly confine to detect_rect.
+    if seg_mask is not None and np.any(seg_mask):
+        k_exp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (adaptive_dilation * 2 + 1, adaptive_dilation * 2 + 1))
+        expanded_rect = cv2.dilate(detect_rect.astype(np.uint8), k_exp).astype(bool)
+        allowed_boundary = expanded_rect & seg_mask
     else:
         allowed_boundary = detect_rect
 
@@ -288,13 +258,9 @@ def _extract_text_glyph_mask(
     # Crucial: Restrict raw glyph extraction strictly to allowed boundary (inside rect & segmentation interior)
     raw_glyph_mask = raw_glyph_mask & allowed_boundary
 
-    # Filter out tiny screentone noise specks (area < 3) on complex backgrounds
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(raw_glyph_mask.astype(np.uint8))
-    glyph_mask = np.zeros_like(raw_glyph_mask)
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= 3:
-            glyph_mask |= (labels == i)
-
+    # Filter out tiny screentone noise specks using fast 2x2 morphological opening
+    k_noise = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    glyph_mask = cv2.morphologyEx(raw_glyph_mask.astype(np.uint8), cv2.MORPH_OPEN, k_noise).astype(bool)
     if not np.any(glyph_mask):
         glyph_mask = raw_glyph_mask
 
