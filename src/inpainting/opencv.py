@@ -92,7 +92,7 @@ class OpenCVInpainter(Inpainter):
         bubble = _existing_bubble(region)
         bubble_source = "existing"
         if bubble is None:
-            bubble = self._bubble_segmenter.segment(Image.fromarray(pixels), padded)
+            bubble = self._bubble_segmenter.segment(pixels, padded)
             bubble_source = "contour"
         if bubble is None:
             bubble = self._find_bubble(pixels, padded)

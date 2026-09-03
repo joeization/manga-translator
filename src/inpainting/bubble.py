@@ -11,7 +11,7 @@ from src.models import TextRegion
 
 class BubbleSegmenter(ABC):
     @abstractmethod
-    def segment(self, image: Image.Image, region: TextRegion) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
+    def segment(self, image: Image.Image | np.ndarray, region: TextRegion) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
         """Return a speech-bubble bounding box and local binary interior mask."""
 
 
@@ -20,8 +20,11 @@ class OpenCVContourBubbleSegmenter(BubbleSegmenter):
         self._white_threshold = white_threshold
         self._padding = padding
 
-    def segment(self, image: Image.Image, region: TextRegion) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
-        pixels = np.array(image.convert("RGB"))
+    def segment(self, image: Image.Image | np.ndarray, region: TextRegion) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
+        if isinstance(image, np.ndarray):
+            pixels = image
+        else:
+            pixels = np.array(image.convert("RGB"))
         left, top, right, bottom = region.bbox
         height, width = pixels.shape[:2]
         outer_left, outer_top = max(0, left - self._padding), max(0, top - self._padding)
