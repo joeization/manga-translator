@@ -16,6 +16,7 @@ from threading import Event, Thread
 from typing import Callable
 
 from PIL import Image
+import requests
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
@@ -331,11 +332,13 @@ def main() -> int:
             raise RuntimeError("No supported image files or ZIP contents were found.")
 
         settings = Settings.load(project_root)
+        ollama_session = requests.Session()
         corrector = OllamaCorrector(
             settings.ollama_host,
             settings.ollama_model,
             settings.source_language,
             settings.correction_prompt_path,
+            session=ollama_session,
         )
         translator = OllamaTranslator(
             settings.ollama_host,
@@ -343,6 +346,7 @@ def main() -> int:
             settings.source_language,
             settings.target_language,
             settings.translation_prompt_path,
+            session=ollama_session,
         )
         pipeline = MangaTranslationPipeline(
             build_ocr(settings),

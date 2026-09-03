@@ -29,9 +29,10 @@ def _strip_code_fence(content: str) -> str:
 class _OllamaEntryClient:
     """Sends one Ollama request per entry while retaining the page's text as context."""
 
-    def __init__(self, host: str, model: str, prompt_path: Path) -> None:
+    def __init__(self, host: str, model: str, prompt_path: Path, session: requests.Session | None = None) -> None:
         self._endpoint = f"{host.rstrip('/')}/api/chat"
         self._model = model
+        self._session = session if session is not None else requests.Session()
         try:
             self._system_prompt = prompt_path.read_text(encoding="utf-8")
         except OSError as error:
@@ -53,7 +54,7 @@ class _OllamaEntryClient:
         system_prompt = self._build_system_prompt(context)
         logger.info("Ollama request for entry: %s", source_text)
         try:
-            response = requests.post(
+            response = self._session.post(
                 self._endpoint,
                 json={
                     "model": self._model,
@@ -101,8 +102,16 @@ class _OllamaEntryClient:
 
 
 class OllamaTranslator(Translator, _OllamaEntryClient):
-    def __init__(self, host: str, model: str, source_language: str, target_language: str, prompt_path: Path) -> None:
-        super().__init__(host, model, prompt_path)
+    def __init__(
+        self,
+        host: str,
+        model: str,
+        source_language: str,
+        target_language: str,
+        prompt_path: Path,
+        session: requests.Session | None = None,
+    ) -> None:
+        super().__init__(host, model, prompt_path, session=session)
         self._source_language = source_language
         self._target_language = target_language
 
@@ -122,8 +131,15 @@ class OllamaTranslator(Translator, _OllamaEntryClient):
 
 
 class OllamaCorrector(_OllamaEntryClient):
-    def __init__(self, host: str, model: str, source_language: str, prompt_path: Path) -> None:
-        super().__init__(host, model, prompt_path)
+    def __init__(
+        self,
+        host: str,
+        model: str,
+        source_language: str,
+        prompt_path: Path,
+        session: requests.Session | None = None,
+    ) -> None:
+        super().__init__(host, model, prompt_path, session=session)
         self._source_language = source_language
 
     def correct(self, texts: list[str], ocr_results: list[OCRResult] | None = None) -> list[str]:
