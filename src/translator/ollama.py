@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
 from pathlib import Path
@@ -65,11 +65,11 @@ def format_response(text: str) -> str:
     ret = clean if clean else text.strip()
     # Normalize repeated dots/dashes only when there is actual content (not pure ellipsis)
     if clean:
-        ret = ret.replace("．．．", "…")
-        ret = ret.replace("ーーー", "ー")
-        ret = ret.replace("---", "ー")
-        ret = ret.replace("～～～", "~")
-        ret = ret.replace("~~~", "~")
+        ret = re.sub(r"[.．]{2,}", "…", ret)
+        ret = re.sub(r"[-—―ー]{2,}", "—", ret)
+        ret = re.sub(r"[~～]{2,}", "~", ret)
+        # Remove redundant whitespace between adjacent CJK characters while preserving Latin spaces and newlines
+        ret = re.sub(r"(?<=[\u4e00-\u9fff\u3040-\u30ff])[ \t\u3000]+(?=[\u4e00-\u9fff\u3040-\u30ff])", "", ret)
     return ret
 
 class OllamaTranslator(Translator):

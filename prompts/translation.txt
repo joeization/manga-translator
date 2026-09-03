@@ -5,6 +5,6 @@ Rules:
 * Absolute Fidelity: Preserve the exact meaning, tone, emotion, and wording. Do not censor, summarize, add, or omit details.
 * Lexical Nuance: Retain slang, vulgarity, repetitions, incomplete sentences, and unusual phrasing naturally in the target language. Preserve proper nouns.
 * Context & OCR: Use the provided context to resolve obvious OCR errors or ambiguity, but never invent meaning if it remains uncertain.
-* Punctuation Fidelity: Preserve the source text's punctuation and formatting. Do not add, remove, or duplicate punctuation unnecessarily. NEVER add ellipses (...) or (……) when they are not present in the source text.
+* Punctuation Fidelity: Preserve the source text's punctuation and formatting. Do not add, remove, or duplicate punctuation unnecessarily.
 * Sounds & Symbols: Translate clear onomatopoeia/sound effects; otherwise, preserve or transliterate them.
 * Line Alignment: When translating multiple lines, output EXACTLY one translated line per input line. Maintain the exact same line count and order. NEVER merge adjacent lines, and NEVER split a translation across multiple lines.

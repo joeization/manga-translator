@@ -17,8 +17,8 @@ from src.inpainting import Inpainter
 from src.models import OCRResult
 from src.ocr.postprocess import sort_manga_reading_order
 from src.renderer import Renderer, TextAnchorDetector
-from src.renderer.pillow_renderer import format_response
 from src.translator import Translator
+from src.translator.ollama import format_response
 
 logger = logging.getLogger(__name__)
 
@@ -169,10 +169,12 @@ class MangaTranslationPipeline:
 
         _check_cancelled(cancel_event)
         try:
-            texts = [region.source_text for region in valid_regions]
-            translations = self._translator.translate(texts, context=context)
-            for region, translation in zip(valid_regions, translations, strict=True):
-                region.translated_text = format_response(translation)
+            untranslated = [r for r in valid_regions if not r.translated_text]
+            if untranslated:
+                texts = [region.source_text for region in untranslated]
+                translations = self._translator.translate(texts, context=context)
+                for region, translation in zip(untranslated, translations, strict=True):
+                    region.translated_text = format_response(translation)
             return valid_regions, False
         except Exception as error:
             logger.warning("Translation failed; saving the original image instead: %s", error)
@@ -235,8 +237,10 @@ class MangaTranslationPipeline:
             return
 
         q_ocr_to_trans: Queue[_PipelinePacket | None] = Queue(maxsize=queue_size)
-        q_trans_to_inpaint: Queue[_PipelinePacket | None] = Queue(maxsize=queue_size)
-        q_inpaint_to_render: Queue[_PipelinePacket | None] = Queue(maxsize=queue_size)
+        q_ocr_to_inpaint: Queue[_PipelinePacket | None] = Queue(maxsize=queue_size)
+        q_trans_done: Queue[_PipelinePacket | None] = Queue(maxsize=queue_size)
+        q_inpaint_done: Queue[_PipelinePacket | None] = Queue(maxsize=queue_size)
+        q_join_to_render: Queue[_PipelinePacket | None] = Queue(maxsize=queue_size)
         q_render_to_out: Queue[_PipelinePacket | None] = Queue(maxsize=queue_size)
 
         def ocr_worker() -> None:
@@ -247,65 +251,81 @@ class MangaTranslationPipeline:
                 try:
                     img = item.load() if hasattr(item, "load") else item
                     packet.original_image = img
-                    packet.regions = self._run_ocr(img, cancel_event)
+                    all_regions = self._run_ocr(img, cancel_event)
+                    translatable = _translation_candidates(
+                        all_regions,
+                        minimum_confidence=self._minimum_ocr_translation_confidence,
+                        weight_sentence=self._ocr_weight_sentence,
+                        weight_mean=self._ocr_weight_mean,
+                        weight_std=self._ocr_weight_std,
+                    )
+                    packet.regions = translatable
+                    trans_ids = set(id(r) for r in translatable)
+                    packet.skipped_regions = [r for r in all_regions if id(r) not in trans_ids]
                 except PipelineError as err:
                     packet.error = err
                 except Exception as err:
                     packet.error = PipelineError("OCR", err)
+
+                inpaint_packet = _PipelinePacket(
+                    index=packet.index,
+                    item=packet.item,
+                    original_image=packet.original_image,
+                    regions=packet.regions,
+                    skipped_regions=packet.skipped_regions,
+                    error=packet.error,
+                )
                 q_ocr_to_trans.put(packet)
+                q_ocr_to_inpaint.put(inpaint_packet)
             q_ocr_to_trans.put(None)
+            q_ocr_to_inpaint.put(None)
 
         def trans_worker() -> None:
             prev_context: str = ""
             while True:
                 packet = q_ocr_to_trans.get()
                 if packet is None:
-                    q_trans_to_inpaint.put(None)
+                    q_trans_done.put(None)
                     q_ocr_to_trans.task_done()
                     break
                 if cancel_event is not None and cancel_event.is_set():
-                    q_trans_to_inpaint.put(None)
+                    q_trans_done.put(None)
                     q_ocr_to_trans.task_done()
                     break
-                if packet.error is None and packet.original_image is not None:
+                if packet.error is None and packet.original_image is not None and packet.regions:
                     try:
-                        all_regions = packet.regions
-                        translatable, failed = self._run_translation(
-                            packet.original_image,
-                            all_regions,
-                            cancel_event,
-                            context=prev_context,
-                        )
-                        if failed:
-                            packet.regions = []
-                            packet.skipped_regions = all_regions
-                            packet.translated_image = packet.original_image
-                        else:
-                            packet.regions = translatable
-                            trans_ids = set(id(r) for r in translatable)
-                            packet.skipped_regions = [r for r in all_regions if id(r) not in trans_ids]
-                            page_translations = [r.translated_text for r in translatable if r.translated_text]
-                            if page_translations:
-                                prev_context = "\n".join(page_translations)
-                    except PipelineError as err:
-                        packet.error = err
+                        untranslated = [r for r in packet.regions if not r.translated_text]
+                        if untranslated:
+                            texts = [region.source_text for region in untranslated]
+                            translations = self._translator.translate(texts, context=prev_context)
+                            for region, translation in zip(untranslated, translations, strict=True):
+                                region.translated_text = format_response(translation)
+                        page_translations = [r.translated_text for r in packet.regions if r.translated_text]
+                        if page_translations:
+                            prev_context = "\n".join(page_translations)
                     except Exception as err:
-                        packet.error = PipelineError("translation", err)
-                q_trans_to_inpaint.put(packet)
+                        logger.warning("Translation failed; saving the original image instead: %s", err)
+                        packet.skipped_regions = packet.skipped_regions + packet.regions
+                        packet.regions = []
+                        packet.translated_image = packet.original_image
+                elif packet.error is None and not packet.regions and packet.original_image is not None:
+                    packet.translated_image = packet.original_image
+
+                q_trans_done.put(packet)
                 q_ocr_to_trans.task_done()
 
         def inpaint_worker() -> None:
             while True:
-                packet = q_trans_to_inpaint.get()
+                packet = q_ocr_to_inpaint.get()
                 if packet is None:
-                    q_inpaint_to_render.put(None)
-                    q_trans_to_inpaint.task_done()
+                    q_inpaint_done.put(None)
+                    q_ocr_to_inpaint.task_done()
                     break
                 if cancel_event is not None and cancel_event.is_set():
-                    q_inpaint_to_render.put(None)
-                    q_trans_to_inpaint.task_done()
+                    q_inpaint_done.put(None)
+                    q_ocr_to_inpaint.task_done()
                     break
-                if packet.error is None and packet.original_image is not None and packet.translated_image is None:
+                if packet.error is None and packet.original_image is not None and packet.regions:
                     try:
                         packet.inpainted_image = self._run_inpaint(packet.original_image.copy(), packet.regions, cancel_event)
                     except PipelineError as err:
@@ -314,19 +334,44 @@ class MangaTranslationPipeline:
                         packet.error = PipelineError("inpainting", err)
                 else:
                     packet.inpainted_image = packet.original_image
-                q_inpaint_to_render.put(packet)
-                q_trans_to_inpaint.task_done()
+                q_inpaint_done.put(packet)
+                q_ocr_to_inpaint.task_done()
+
+        def join_worker() -> None:
+            while True:
+                p_trans = q_trans_done.get()
+                p_inpaint = q_inpaint_done.get()
+                if p_trans is None or p_inpaint is None:
+                    q_join_to_render.put(None)
+                    if p_trans is not None:
+                        q_trans_done.task_done()
+                    if p_inpaint is not None:
+                        q_inpaint_done.task_done()
+                    break
+                if cancel_event is not None and cancel_event.is_set():
+                    q_join_to_render.put(None)
+                    q_trans_done.task_done()
+                    q_inpaint_done.task_done()
+                    break
+
+                p_trans.inpainted_image = p_inpaint.inpainted_image
+                if p_inpaint.error is not None and p_trans.error is None:
+                    p_trans.error = p_inpaint.error
+
+                q_join_to_render.put(p_trans)
+                q_trans_done.task_done()
+                q_inpaint_done.task_done()
 
         def render_worker() -> None:
             while True:
-                packet = q_inpaint_to_render.get()
+                packet = q_join_to_render.get()
                 if packet is None:
                     q_render_to_out.put(None)
-                    q_inpaint_to_render.task_done()
+                    q_join_to_render.task_done()
                     break
                 if cancel_event is not None and cancel_event.is_set():
                     q_render_to_out.put(None)
-                    q_inpaint_to_render.task_done()
+                    q_join_to_render.task_done()
                     break
                 if packet.error is None and packet.inpainted_image is not None and packet.translated_image is None:
                     try:
@@ -344,12 +389,13 @@ class MangaTranslationPipeline:
                 elif packet.translated_image is None:
                     packet.translated_image = packet.original_image
                 q_render_to_out.put(packet)
-                q_inpaint_to_render.task_done()
+                q_join_to_render.task_done()
 
         threads = [
             Thread(target=ocr_worker, daemon=True),
             Thread(target=trans_worker, daemon=True),
             Thread(target=inpaint_worker, daemon=True),
+            Thread(target=join_worker, daemon=True),
             Thread(target=render_worker, daemon=True),
         ]
         for t in threads:
@@ -365,8 +411,10 @@ class MangaTranslationPipeline:
                 q_render_to_out.task_done()
         finally:
             _drain_queue(q_ocr_to_trans)
-            _drain_queue(q_trans_to_inpaint)
-            _drain_queue(q_inpaint_to_render)
+            _drain_queue(q_ocr_to_inpaint)
+            _drain_queue(q_trans_done)
+            _drain_queue(q_inpaint_done)
+            _drain_queue(q_join_to_render)
             _drain_queue(q_render_to_out)
             for t in threads:
                 t.join(timeout=1.0)

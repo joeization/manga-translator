@@ -18,7 +18,7 @@ class BreakPriority(IntEnum):
     CHAR = 5        # Character-level break (fallback when line overflows)
 
 
-SENTENCE_TERMINALS = set("。！？!?…")
+SENTENCE_TERMINALS = set("。！？!?…︙⋯‥⋮")
 CLAUSE_TERMINALS = set("，、；;：:—～~")
 CLOSING_PUNCTUATION = set("」』”’）)】〕》〉")
 OPENING_PUNCTUATION = set("「『“‘（(【〔《〈")
@@ -75,9 +75,21 @@ def _segment_paragraph(text: str) -> list[TextSegment]:
         current_chars.append(char)
         idx += 1
 
+        # Check for multiple consecutive dots (e.g. "..." or "..")
+        if char == "." and idx < n and text[idx] == ".":
+            while idx < n and (text[idx] in SENTENCE_TERMINALS or text[idx] in CLOSING_PUNCTUATION or text[idx] == "."):
+                current_chars.append(text[idx])
+                idx += 1
+            while idx < n and text[idx] == " ":
+                current_chars.append(text[idx])
+                idx += 1
+            segments.append(TextSegment(text="".join(current_chars), break_after=BreakPriority.SENTENCE))
+            current_chars = []
+            continue
+
         # Consume any consecutive punctuation or closing quotes attached to this segment
         if char in SENTENCE_TERMINALS:
-            while idx < n and (text[idx] in SENTENCE_TERMINALS or text[idx] in CLOSING_PUNCTUATION):
+            while idx < n and (text[idx] in SENTENCE_TERMINALS or text[idx] in CLOSING_PUNCTUATION or text[idx] == "."):
                 current_chars.append(text[idx])
                 idx += 1
             # Consume following space if any

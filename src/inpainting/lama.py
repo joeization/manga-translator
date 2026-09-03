@@ -99,33 +99,54 @@ class LamaInpainter(Inpainter):
             region.metadata = {**(region.metadata or {}), "ink_color": ink_color}
 
         # Build composite mask for original text glyphs (prioritizing glyph strokes over full bubble)
+        output_pixels = img_rgb.copy()
         full_mask = np.zeros((h, w), dtype=np.uint8)
         valid_bboxes: list[tuple[int, int, int, int]] = []
+        fast_path_count = 0
         for region in regions:
             mask, bbox = _extract_text_glyph_mask(img_rgb, region, h, w, mask_dilation=self._mask_dilation)
             if mask is not None and bbox is not None:
                 region.inpaint_bbox = bbox
                 region.inpaint_mask = mask
-                valid_bboxes.append(bbox)
                 rl, rt, rr, rb = bbox
                 mask_uint8 = mask.astype(np.uint8) * 255
                 mh, mw = mask_uint8.shape[:2]
                 rh, rw = rb - rt, rr - rl
                 mh_clip, mw_clip = min(mh, rh), min(mw, rw)
-                if mh_clip > 0 and mw_clip > 0:
+                if mh_clip <= 0 or mw_clip <= 0:
+                    continue
+
+                # Fast-path: Check if the non-text background of this bubble is pure white or flat solid color
+                seg_mask = None
+                if region.layout_mask is not None and region.layout_bbox is not None:
+                    seg_mask = slice_mask_to_roi((rl, rt, rr, rb), region.layout_bbox, region.layout_mask)
+
+                roi_patch = img_rgb[rt : rt + mh_clip, rl : rl + mw_clip]
+                is_flat, flat_bg_color = _is_flat_background(roi_patch, mask[:mh_clip, :mw_clip], seg_mask)
+
+                if is_flat and flat_bg_color is not None:
+                    # Instant fill on pure white / flat solid background (bypasses neural inference)
+                    mask_bool = mask[:mh_clip, :mw_clip]
+                    output_pixels[rt : rt + mh_clip, rl : rl + mw_clip][mask_bool] = flat_bg_color
+                    fast_path_count += 1
+                else:
+                    # Complex background (artwork / screentones) queued for neural inpainting
+                    valid_bboxes.append(bbox)
                     full_mask[rt : rt + mh_clip, rl : rl + mw_clip] = np.maximum(
                         full_mask[rt : rt + mh_clip, rl : rl + mw_clip],
                         mask_uint8[:mh_clip, :mw_clip],
                     )
 
+        if fast_path_count > 0:
+            logger.info("LaMa: fast-path filled %d flat/white regions instantly", fast_path_count)
+
         if not np.any(full_mask):
-            return image
+            return Image.fromarray(output_pixels, mode="RGB")
 
         # Cluster nearby bboxes for high-resolution ROI patch inpainting
         roi_clusters = _cluster_bboxes(valid_bboxes, margin=48, img_w=w, img_h=h)
         logger.info("LaMa: running neural inpainting on %d regions across %d ROI clusters", len(valid_bboxes), len(roi_clusters))
 
-        output_pixels = img_rgb.copy()
         for crop_l, crop_t, crop_r, crop_b in roi_clusters:
             crop_img = img_rgb[crop_t:crop_b, crop_l:crop_r]
             crop_mask = full_mask[crop_t:crop_b, crop_l:crop_r]
@@ -171,6 +192,52 @@ class LamaInpainter(Inpainter):
 
         out_uint8 = np.clip(np.round(result), 0, 255).astype(np.uint8)
         return cv2.resize(out_uint8, (patch_w, patch_h), interpolation=cv2.INTER_CUBIC)
+
+
+def _is_flat_background(
+    roi: np.ndarray,
+    mask: np.ndarray,
+    seg_mask: np.ndarray | None = None,
+) -> tuple[bool, np.ndarray | None]:
+    """Check if the non-text background of an ROI is uniform (pure white or solid color)."""
+    mh, mw = mask.shape[:2]
+    rh, rw = roi.shape[:2]
+    h, w = min(mh, rh), min(mw, rw)
+    if h <= 0 or w <= 0:
+        return False, None
+
+    roi_sub = roi[:h, :w]
+    mask_sub = mask[:h, :w]
+
+    if seg_mask is not None:
+        sh, sw = seg_mask.shape[:2]
+        sh_clip, sw_clip = min(h, sh), min(w, sw)
+        bg_selector = seg_mask[:sh_clip, :sw_clip] & (~mask_sub[:sh_clip, :sw_clip])
+        roi_eval = roi_sub[:sh_clip, :sw_clip]
+    else:
+        bg_selector = ~mask_sub
+        roi_eval = roi_sub
+
+    bg_pixels = roi_eval[bg_selector]
+    if bg_pixels.shape[0] < 16:
+        return False, None
+
+    gray = cv2.cvtColor(roi_eval, cv2.COLOR_RGB2GRAY)
+    bg_gray = gray[bg_selector]
+    mean_val = float(np.mean(bg_gray))
+    std_val = float(np.std(bg_gray))
+
+    # Condition 1: Pure white speech bubble (standard in 80%+ manga dialogues)
+    if mean_val >= 235 and std_val <= 10.0:
+        bg_color = np.median(bg_pixels, axis=0).astype(roi.dtype)
+        return True, bg_color
+
+    # Condition 2: Solid flat color / tone (e.g. solid black or flat screentone tone)
+    if std_val <= 3.5:
+        bg_color = np.median(bg_pixels, axis=0).astype(roi.dtype)
+        return True, bg_color
+
+    return False, None
 
 
 def _extract_text_glyph_mask(

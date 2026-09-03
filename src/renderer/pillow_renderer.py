@@ -41,11 +41,22 @@ VERTICAL_PUNCTUATION_MAP = {
     "\u2015": "\ufe31",  # ― -> ︱
     "\u2014": "\ufe31",  # — -> ︱
     "-": "\ufe31",       # - -> ︱
+    "ー": "︱",          # U+30FC Katakana-Hiragana prolonged sound mark -> ︱
+    "ｰ": "︱",          # U+FF70 Halfwidth prolonged sound mark -> ︱
+    "|": "︱",          # U+007C ASCII pipe / vertical bar -> ︱
+    "｜": "︱",         # U+FF5C Fullwidth vertical line -> ︱
+    "–": "︱",          # U+2013 En dash -> ︱
     "\u2026": "\ufe19",  # … -> ︙
+    "\u22ef": "\ufe19",  # ⋯ -> ︙
+    "\u2025": "\ufe19",  # ‥ -> ︙
+    "\u22ee": "\ufe19",  # ⋮ -> ︙
 }
 
 def to_vertical_text(text: str) -> str:
     """Convert horizontal punctuation and brackets to vertical orientation symbols."""
+    text = format_response(text)
+    text = re.sub(r"\.{2,}", "…", text)
+    text = re.sub(r"．{2,}", "…", text)
     return "".join(VERTICAL_PUNCTUATION_MAP.get(char, char) for char in text)
 
 
@@ -202,13 +213,48 @@ class PillowRenderer(Renderer):
             return (int(ink[0]), int(ink[1]), int(ink[2]))
         return (0, 0, 0)
 
+    def _is_horizontal_region(
+        self,
+        region: TextRegion,
+        width: int | None = None,
+        height: int | None = None,
+        render_bounds: tuple[int, int, int, int] | None = None,
+        aspect_ratio_threshold: float = 1.3,
+    ) -> bool:
+        """Check if region is a horizontal rectangle that should be rendered left-to-right, top-to-bottom."""
+        if self._text_direction == "horizontal":
+            return True
+
+        bl, bt, br, bb = region.bbox
+        bw = max(1, br - bl)
+        bh = max(1, bb - bt)
+
+        # 1. Detected text box itself is distinctly horizontal (e.g. wide banner, narration bar)
+        if bw >= bh * aspect_ratio_threshold:
+            return True
+
+        # 2. Bubble layout mask is distinctly horizontal and text is not strictly vertical
+        if width is not None and height is not None and height > 0:
+            if width >= height * aspect_ratio_threshold and bw >= bh * 1.05:
+                return True
+
+        # 3. Non-overlapping render bounds are distinctly horizontal and text is not strictly vertical
+        if render_bounds is not None:
+            rl, rt, rr, rb = render_bounds
+            rw = max(1, rr - rl)
+            rh = max(1, rb - rt)
+            if rw >= rh * aspect_ratio_threshold and bw >= bh * 1.05:
+                return True
+
+        return False
+
     def _render_region(
         self,
         draw: ImageDraw.ImageDraw,
         region: TextRegion,
         render_bounds: tuple[int, int, int, int] | None = None,
     ) -> None:
-        if self._text_direction == "vertical-rtl":
+        if self._text_direction == "vertical-rtl" and not self._is_horizontal_region(region, render_bounds=render_bounds):
             self._render_vertical_region(draw, region, render_bounds=render_bounds)
             return
         left, top, right, bottom = render_bounds if render_bounds is not None else _expand_bbox_towards_layout(region.bbox, region.layout_bbox)
@@ -413,7 +459,8 @@ class MaskAwarePillowRenderer(PillowRenderer):
         left, top = layout_left, layout_top
         fill = self._text_color(region)
 
-        if self._text_direction == "vertical-rtl":
+        is_horiz = self._is_horizontal_region(region, width=width, height=height, render_bounds=render_bounds)
+        if self._text_direction == "vertical-rtl" and not is_horiz:
             self._render_vertical_mask_region(draw, region, mask, left + x, top + y, width, height)
             return
 
@@ -440,11 +487,11 @@ class MaskAwarePillowRenderer(PillowRenderer):
                 comfortable_floor = max(self._min_font_size, int(self._font_size * 0.55))
                 if layout_res is not None and layout_res.score > 0 and layout_res.font_size >= comfortable_floor:
                     font = self._font(layout_res.font_size)
-                    cur_y = top + ry + self._padding + (rh - self._padding * 2 - layout_res.total_height) / 2
+                    cur_y = top + y + ry + self._padding + (rh - self._padding * 2 - layout_res.total_height) / 2
                     for line in layout_res.line_details:
                         bounds = draw.textbbox((0, 0), line.text, font=font)
                         lw = bounds[2] - bounds[0]
-                        lx = left + rx + self._padding + (rw - self._padding * 2 - lw) / 2 - bounds[0]
+                        lx = left + x + rx + self._padding + (rw - self._padding * 2 - lw) / 2 - bounds[0]
                         _draw_text_with_stroke(draw, (lx, cur_y - bounds[1]), line.text, font, fill, is_multiline=False)
                         cur_y += layout_res.font_size + layout_res.line_spacing
                         if line.is_paragraph_end:
@@ -484,7 +531,7 @@ class MaskAwarePillowRenderer(PillowRenderer):
             _draw_text_with_stroke(draw, pos, text, font, fill, is_multiline=True)
             return
 
-        super()._render_region(draw, region)
+        super()._render_region(draw, region, render_bounds=render_bounds)
 
     def _render_vertical_mask_region(
         self,
@@ -508,40 +555,39 @@ class MaskAwarePillowRenderer(PillowRenderer):
             super()._render_region(draw, region)
             return
 
-        # 1. Single-sentence standard rectangular bubble: try Maximum Inscribed Rectangle with TextAutoLayout
-        if len(sentences) == 1:
-            inscribed = find_maximum_inscribed_rectangle(mask)
-            mask_area = float(np.count_nonzero(mask))
-            if inscribed is not None and mask_area > 0:
-                rx, ry, rw, rh = inscribed
-                inscribed_ratio = (rw * rh) / mask_area
-                if inscribed_ratio >= 0.80 and rw >= self._min_font_size and rh >= self._min_font_size * 2:
-                    auto_layout = TextAutoLayout(
-                        vertical_text,
-                        orientation="vertical-rtl",
-                        font_resolver=self._font,
+        # 1. Standard rectangular bubble or clean oval: try Maximum Inscribed Rectangle with TextAutoLayout
+        inscribed = find_maximum_inscribed_rectangle(mask)
+        mask_area = float(np.count_nonzero(mask))
+        if inscribed is not None and mask_area > 0:
+            rx, ry, rw, rh = inscribed
+            inscribed_ratio = (rw * rh) / mask_area
+            if inscribed_ratio >= 0.70 and rw >= self._min_font_size and rh >= self._min_font_size * 2:
+                auto_layout = TextAutoLayout(
+                    vertical_text,
+                    orientation="vertical-rtl",
+                    font_resolver=self._font,
+                )
+                layout_res = auto_layout.find_optimal_layout(
+                    available_width=max(1, rw - self._padding * 2),
+                    available_height=max(1, rh - self._padding * 2),
+                    max_font_size=min(self._max_font_size, max(self._font_size, rh)),
+                    preferred_font_size=self._font_size,
+                    min_font_size=self._min_font_size,
+                )
+                comfortable_floor = max(self._min_font_size, int(self._font_size * 0.55))
+                if layout_res is not None and layout_res.score > 0 and layout_res.font_size >= comfortable_floor:
+                    font = self._font(layout_res.font_size)
+                    _draw_vertical_columns(
+                        draw,
+                        layout_res.lines,
+                        font=font,
+                        left=left + rx,
+                        top=top + ry,
+                        width=rw,
+                        height=rh,
+                        fill=fill,
                     )
-                    layout_res = auto_layout.find_optimal_layout(
-                        available_width=max(1, rw - self._padding * 2),
-                        available_height=max(1, rh - self._padding * 2),
-                        max_font_size=min(self._max_font_size, max(self._font_size, rh)),
-                        preferred_font_size=self._font_size,
-                        min_font_size=self._min_font_size,
-                    )
-                    comfortable_floor = max(self._min_font_size, int(self._font_size * 0.55))
-                    if layout_res is not None and layout_res.score > 0 and layout_res.font_size >= comfortable_floor:
-                        font = self._font(layout_res.font_size)
-                        _draw_vertical_columns(
-                            draw,
-                            layout_res.lines,
-                            font=font,
-                            left=left + rx,
-                            top=top + ry,
-                            width=rw,
-                            height=rh,
-                            fill=fill,
-                        )
-                        return
+                    return
 
         # 2. Multi-sentence / irregular / connected bubble: use Column-wise Vertical Spans inside the mask
         low = self._min_font_size
@@ -599,6 +645,10 @@ def _score_vertical_layout(size: int, max_size: int, placements: list[tuple[str,
     if num_cols == 1:
         score += 0.25
     elif num_cols >= 2:
+        # In vertical text, never split short phrases (<= 3 chars, e.g. "当然") across multiple columns
+        if max(col_lengths) <= 1 or sum(col_lengths) <= 3:
+            return -1000.0
+
         last_len = col_lengths[-1]
         max_len = max(col_lengths)
         min_len = min(col_lengths)
@@ -847,7 +897,9 @@ def _vertical_mask_layout(
         target_center_x = (group[0][0] + group[-1][0]) / 2
         best_cand: tuple[list[tuple[int, int, int, int]], list[str]] | None = None
         best_score = float("inf")
-        for k in range(1, len(group) + 1):
+        # In vertical layout, short phrases (<= 3 chars, e.g. "当然") must stay in 1 column
+        max_k = 1 if n_chars <= 3 else len(group)
+        for k in range(1, max_k + 1):
             for s_idx in range(len(group) - k + 1):
                 cand = group[s_idx : s_idx + k]
                 caps = [c[3] for c in cand]

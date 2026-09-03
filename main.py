@@ -312,10 +312,10 @@ def build_side_by_side_image(original: Image.Image, translated: Image.Image) -> 
         target_h = max(orig_rgb.height, trans_rgb.height)
         if orig_rgb.height != target_h:
             w = max(1, round(orig_rgb.width * target_h / orig_rgb.height))
-            orig_rgb = orig_rgb.resize((w, target_h), Image.Resampling.LANCZOS)
+            orig_rgb = orig_rgb.resize((w, target_h), Image.Resampling.BILINEAR)
         if trans_rgb.height != target_h:
             w = max(1, round(trans_rgb.width * target_h / trans_rgb.height))
-            trans_rgb = trans_rgb.resize((w, target_h), Image.Resampling.LANCZOS)
+            trans_rgb = trans_rgb.resize((w, target_h), Image.Resampling.BILINEAR)
 
     combined_width = orig_rgb.width + trans_rgb.width
     combined_height = max(orig_rgb.height, trans_rgb.height)

@@ -164,7 +164,9 @@ class BaberuOCR:
         assert self._device is not None
 
         rgb_images = [image.convert("RGB") for image in images]
-        pixel_values = self._image_processor(rgb_images, return_tensors="pt")["pixel_values"].to(self._device)
+        pixel_values = self._image_processor(rgb_images, return_tensors="pt")["pixel_values"].to(
+            self._device, dtype=self._model.dtype
+        )
         batch_size = len(images)
         input_ids = torch.full(
             (batch_size, 1),
@@ -201,7 +203,7 @@ class BaberuOCR:
             )
         return results
 
-    def _recognize_all(self, images: list[Image.Image], chunk_size: int = 8) -> list[tuple[str, list[float] | None]]:
+    def _recognize_all(self, images: list[Image.Image], chunk_size: int = 16) -> list[tuple[str, list[float] | None]]:
         results: list[tuple[str, list[float] | None]] = []
         for i in range(0, len(images), chunk_size):
             chunk = images[i : i + chunk_size]
