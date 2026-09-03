@@ -95,7 +95,12 @@ class PillowRenderer(Renderer):
         available_height = max(1, bottom - top - self._padding * 2)
 
         fill = self._text_color(region)
-        for size in self._font_sizes(available_height):
+        low = self._min_font_size
+        high = min(self._max_font_size, max(self._font_size, available_height))
+        best_layout: tuple[str, tuple[float, float], ImageFont.FreeTypeFont] | None = None
+
+        while low <= high:
+            size = (low + high) // 2
             font = self._font(size)
             text = _wrap_text(draw, region.translated_text or "", font, available_width)
             bounds = draw.multiline_textbbox((0, 0), text, font=font, spacing=0, align="center")
@@ -103,8 +108,15 @@ class PillowRenderer(Renderer):
             if text_width <= available_width and text_height <= available_height:
                 x = left + (right - left - text_width) / 2 - bounds[0]
                 y = top + (bottom - top - text_height) / 2 - bounds[1]
-                _draw_text_with_stroke(draw, (x, y), text, font, fill, is_multiline=True)
-                return
+                best_layout = (text, (x, y), font)
+                low = size + 1
+            else:
+                high = size - 1
+
+        if best_layout is not None:
+            text, pos, font = best_layout
+            _draw_text_with_stroke(draw, pos, text, font, fill, is_multiline=True)
+            return
 
     def _render_vertical_region(self, draw: ImageDraw.ImageDraw, region: TextRegion) -> None:
         left, top, right, bottom = region.bbox
@@ -208,17 +220,38 @@ class MaskAwarePillowRenderer(PillowRenderer):
         if self._text_direction == "vertical-rtl":
             self._render_vertical_mask_region(draw, region, mask, left + x, top + y, width, height)
             return
-        for size in self._font_sizes(height):
+        low = self._min_font_size
+        high = min(self._max_font_size, max(self._font_size, height))
+        best_mask_layout: tuple[str, tuple[float, float], ImageFont.FreeTypeFont] | None = None
+
+        while low <= high:
+            size = (low + high) // 2
             font = self._font(size)
             text = _wrap_text(draw, region.translated_text or "", font, max(1, width - self._padding * 2))
             bounds = draw.multiline_textbbox((0, 0), text, font=font, spacing=0, align="center")
             text_width, text_height = bounds[2] - bounds[0], bounds[3] - bounds[1]
-            placement = _find_mask_placement(mask, text_width + self._padding * 2, text_height + self._padding * 2, _region_center(region.bbox, left + x, top + y))
+            placement = _find_mask_placement(
+                mask,
+                text_width + self._padding * 2,
+                text_height + self._padding * 2,
+                _region_center(region.bbox, left + x, top + y),
+            )
             if placement is not None:
                 placement_x, placement_y = placement
-                pos = (left + x + placement_x + self._padding - bounds[0], top + y + placement_y + self._padding - bounds[1])
-                _draw_text_with_stroke(draw, pos, text, font, fill, is_multiline=True)
-                return
+                pos = (
+                    left + x + placement_x + self._padding - bounds[0],
+                    top + y + placement_y + self._padding - bounds[1],
+                )
+                best_mask_layout = (text, pos, font)
+                low = size + 1
+            else:
+                high = size - 1
+
+        if best_mask_layout is not None:
+            text, pos, font = best_mask_layout
+            _draw_text_with_stroke(draw, pos, text, font, fill, is_multiline=True)
+            return
+
         super()._render_region(draw, region)
 
     def _render_vertical_mask_region(
@@ -231,18 +264,31 @@ class MaskAwarePillowRenderer(PillowRenderer):
         width: int,
         height: int,
     ) -> None:
-        for size in self._font_sizes(height):
-            anchor = _region_center(region.bbox, left, top)
-            vertical_text = to_vertical_text(region.translated_text or "")
+        anchor = _region_center(region.bbox, left, top)
+        vertical_text = to_vertical_text(region.translated_text or "")
+        low = self._min_font_size
+        high = min(self._max_font_size, max(self._font_size, height))
+        best_vertical_layout: tuple[list[tuple[str, int, int]], int] | None = None
+
+        while low <= high:
+            size = (low + high) // 2
             placements = _vertical_mask_layout(mask, vertical_text, self._font(size), self._padding, anchor)
             if placements is not None:
-                font = self._font(size)
-                fill = self._text_color(region)
-                for column, column_x, column_y in placements:
-                    for character in column:
-                        _draw_text_with_stroke(draw, (left + column_x, top + column_y), character, font, fill, is_multiline=False)
-                        column_y += size
-                return
+                best_vertical_layout = (placements, size)
+                low = size + 1
+            else:
+                high = size - 1
+
+        if best_vertical_layout is not None:
+            placements, size = best_vertical_layout
+            font = self._font(size)
+            fill = self._text_color(region)
+            for column, column_x, column_y in placements:
+                for character in column:
+                    _draw_text_with_stroke(draw, (left + column_x, top + column_y), character, font, fill, is_multiline=False)
+                    column_y += size
+            return
+
         super()._render_region(draw, region)
 
 
