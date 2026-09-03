@@ -67,6 +67,22 @@ def _parse_indexed_output(content: str, expected_count: int) -> list[str | None]
     return results
 
 
+def format_response(text: str) -> str:
+    """Remove leading ellipsis/dots/dashes from translated text. Preserves pure-ellipsis text."""
+    if not text:
+        return ""
+    clean = re.sub(r"^[\s.…⋯︙·\-—~～]+", "", text).strip()
+    # If stripping removed everything, keep the original (pure ellipsis / silence)
+    ret = clean if clean else text.strip()
+    # Normalize repeated dots/dashes only when there is actual content (not pure ellipsis)
+    if clean:
+        ret = ret.replace("．．．", "…")
+        ret = ret.replace("ーーー", "ー")
+        ret = ret.replace("---", "ー")
+        ret = ret.replace("～～～", "~")
+        ret = ret.replace("~~~", "~")
+    return ret
+
 class OllamaTranslator(Translator):
     def __init__(
         self,
@@ -116,13 +132,13 @@ class OllamaTranslator(Translator):
 
             if len(lines) == len(sanitized_texts):
                 logger.info("Whole-page translation succeeded (%d lines).", len(lines))
-                return lines
+                return [format_response(l) for l in lines]
 
             # Also check if model produced indexed lines [1], [2] etc.
             indexed_try = _parse_indexed_output(content, len(sanitized_texts))
             if all(r is not None and r.strip() for r in indexed_try):
                 logger.info("Whole-page indexed translation succeeded (%d lines).", len(indexed_try))
-                return [r.strip() for r in indexed_try if r is not None]
+                return [format_response(r.strip()) for r in indexed_try if r is not None]
 
             logger.warning(
                 "Whole-page translation returned %d lines, expected %d. Falling back to single-sentence translation without context.",
@@ -148,7 +164,7 @@ class OllamaTranslator(Translator):
                 parsed = _parse_indexed_output(content, len(sanitized_texts))
                 if all(p is not None and p.strip() for p in parsed):
                     logger.info("Numbered batch translation succeeded (%d lines).", len(parsed))
-                    return [p.strip() for p in parsed if p is not None]
+                    return [format_response(p.strip()) for p in parsed if p is not None]
 
                 missing_indices = [i for i, p in enumerate(parsed) if p is None or not p.strip()]
                 if len(missing_indices) < len(sanitized_texts) // 2:
@@ -165,7 +181,7 @@ class OllamaTranslator(Translator):
                         clean = res_lines[0] if res_lines else single_res.strip()
                         clean = re.sub(r"^\s*\[?\d+\]?[\s.:、\-—]*", "", clean).strip()
                         parsed[idx] = clean
-                    return [p if p is not None else sanitized_texts[i] for i, p in enumerate(parsed)]
+                    return [format_response(p) if p is not None else sanitized_texts[i] for i, p in enumerate(parsed)]
             except Exception as error:
                 logger.warning("Numbered batch attempt failed (%s). Falling back to line-by-line translation.", error)
 
@@ -181,7 +197,7 @@ class OllamaTranslator(Translator):
             res_lines = [l.strip() for l in single_res.splitlines() if l.strip()]
             clean = res_lines[0] if res_lines else single_res.strip()
             clean = re.sub(r"^\s*\[?\d+\]?[\s.:、\-—]*", "", clean).strip()
-            fallback_results.append(clean)
+            fallback_results.append(format_response(clean))
 
         return fallback_results
 
@@ -257,7 +273,7 @@ class OllamaTranslator(Translator):
 
         logger.info("Ollama response content:\n%s", content)
 
-        result = _strip_code_fence(content)
+        result = format_response(_strip_code_fence(content))
         if not result:
             raise TranslationError(f"Ollama response from {self._endpoint} contained no text.")
         return result

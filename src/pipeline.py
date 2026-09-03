@@ -17,6 +17,7 @@ from src.inpainting import Inpainter
 from src.models import OCRResult
 from src.ocr.postprocess import sort_manga_reading_order
 from src.renderer import Renderer, TextAnchorDetector
+from src.renderer.pillow_renderer import strip_leading_ellipsis
 from src.translator import Translator
 
 logger = logging.getLogger(__name__)
@@ -171,7 +172,7 @@ class MangaTranslationPipeline:
             texts = [region.source_text for region in valid_regions]
             translations = self._translator.translate(texts, context=context)
             for region, translation in zip(valid_regions, translations, strict=True):
-                region.translated_text = translation
+                region.translated_text = strip_leading_ellipsis(translation)
             return valid_regions, False
         except Exception as error:
             logger.warning("Translation failed; saving the original image instead: %s", error)
@@ -495,8 +496,11 @@ def draw_debug_image(image: Image.Image, regions: list[OCRResult]) -> Image.Imag
     w, h = debug_image.size
     overlay_pixels = np.zeros((h, w, 4), dtype=np.uint8)
 
+    from src.renderer.pillow_renderer import compute_non_overlapping_render_bounds
+    render_bounds_list = compute_non_overlapping_render_bounds(regions)
+
     # 1. Accumulate semi-transparent mask overlays
-    for region in regions:
+    for region, bounds in zip(regions, render_bounds_list):
         # Red semi-transparent fill for segmentation bubble
         if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
             left, top, right, bottom = region.layout_bbox
@@ -522,8 +526,11 @@ def draw_debug_image(image: Image.Image, regions: list[OCRResult]) -> Image.Imag
 
     # 3. Draw sharp contour outlines and bounding boxes on top
     draw = ImageDraw.Draw(debug_image)
-    for region in regions:
+    for region, bounds in zip(regions, render_bounds_list):
+        # Blue: YOLO text detection box
         draw.rectangle(region.bbox, outline="blue", width=3)
+
+        # Red: Segmentation bubble contour
         if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
             left, top, _, _ = region.layout_bbox
             contours, _ = cv2.findContours(region.layout_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -535,6 +542,24 @@ def draw_debug_image(image: Image.Image, regions: list[OCRResult]) -> Image.Imag
             left, top, right, bottom = region.bbox
             inset = 4
             draw.rectangle((left + inset, top + inset, right - inset, bottom - inset), outline="red", width=2)
+
+        # Green: Render region outline & bounding box
+        rl, rt, rr, rb = bounds
+        if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
+            layout_left, layout_top, _, _ = region.layout_bbox
+            ml = max(0, rl - layout_left)
+            mt = max(0, rt - layout_top)
+            mr = min(region.layout_mask.shape[1], rr - layout_left)
+            mb = min(region.layout_mask.shape[0], rb - layout_top)
+            if mr > ml and mb > mt:
+                sub_mask = np.zeros_like(region.layout_mask, dtype=np.uint8)
+                sub_mask[mt:mb, ml:mr] = region.layout_mask[mt:mb, ml:mr].astype(np.uint8)
+                r_contours, _ = cv2.findContours(sub_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for contour in r_contours:
+                    points = [(layout_left + int(point[0][0]), layout_top + int(point[0][1])) for point in contour]
+                    if len(points) > 1:
+                        draw.line(points + [points[0]], fill="#00e600", width=3)
+        draw.rectangle((rl, rt, rr, rb), outline="#00e600", width=2)
 
     return debug_image
 

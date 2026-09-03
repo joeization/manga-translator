@@ -5,6 +5,7 @@ and two-pass outward-only white/dark stroke outline rendering.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import cv2
@@ -14,6 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 from src.models import TextRegion
 
 from .base import Renderer
+from .layout import TextAutoLayout
 
 VERTICAL_PUNCTUATION_MAP = {
     "\u300c": "\ufe41",  # 「 -> ﹁
@@ -43,8 +45,17 @@ VERTICAL_PUNCTUATION_MAP = {
 }
 
 
+def strip_leading_ellipsis(text: str) -> str:
+    """Remove leading ellipsis, dots, or dashes from translated text while preserving pure ellipsis text."""
+    if not text:
+        return ""
+    clean = re.sub(r"^[\s.…⋯︙·\-—~～]+", "", text).strip()
+    return clean if clean else text.strip()
+
+
 def to_vertical_text(text: str) -> str:
     """Convert horizontal punctuation and brackets to vertical orientation symbols."""
+    text = strip_leading_ellipsis(text)
     return "".join(VERTICAL_PUNCTUATION_MAP.get(char, char) for char in text)
 
 
@@ -52,28 +63,10 @@ def _expand_bbox_towards_layout(
     bbox: tuple[int, int, int, int],
     layout_bbox: tuple[int, int, int, int] | None,
 ) -> tuple[int, int, int, int]:
-    """Adaptively expand text bbox towards surrounding bubble/layout bbox when text occupies a small fraction."""
+    """Expand text bbox towards surrounding bubble/layout bbox."""
     if layout_bbox is None:
         return bbox
-    l, t, r, b = bbox
-    lbl, lbt, lbr, lbb = layout_bbox
-    text_w, text_h = max(1, r - l), max(1, b - t)
-    layout_w, layout_h = max(1, lbr - lbl), max(1, lbb - lbt)
-    text_area = text_w * text_h
-    layout_area = layout_w * layout_h
-    if layout_area <= 0 or text_area >= layout_area:
-        return bbox
-
-    coverage_ratio = min(1.0, text_area / layout_area)
-    expand_ratio = min(0.85, max(0.0, (0.75 - coverage_ratio) * 1.5))
-    if expand_ratio <= 0:
-        return bbox
-
-    new_l = max(lbl, l - int((l - lbl) * expand_ratio))
-    new_r = min(lbr, r + int((lbr - r) * expand_ratio))
-    new_t = max(lbt, t - int((t - lbt) * expand_ratio))
-    new_b = min(lbb, b + int((lbb - b) * expand_ratio))
-    return (new_l, new_t, new_r, new_b)
+    return layout_bbox
 
 
 def compute_non_overlapping_render_bounds(
@@ -160,16 +153,19 @@ def compute_non_overlapping_render_bounds(
         lim_t = min(lim_t, ti)
         lim_b = max(lim_b, bi)
 
-        text_area = max(1, (ri_x - li) * (bi - ti))
-        lim_area = max(1, (lim_r - lim_l) * (lim_b - lim_t))
-        cov = min(1.0, text_area / lim_area)
-        exp = min(0.85, max(0.0, (0.75 - cov) * 1.5))
+        if ri.layout_bbox is not None:
+            expanded_bounds.append((lim_l, lim_t, lim_r, lim_b))
+        else:
+            text_area = max(1, (ri_x - li) * (bi - ti))
+            lim_area = max(1, (lim_r - lim_l) * (lim_b - lim_t))
+            cov = min(1.0, text_area / lim_area)
+            exp = min(0.85, max(0.0, (0.75 - cov) * 1.5))
 
-        new_l = max(lim_l, li - int((li - lim_l) * exp))
-        new_r = min(lim_r, ri_x + int((lim_r - ri_x) * exp))
-        new_t = max(lim_t, ti - int((ti - lim_t) * exp))
-        new_b = min(lim_b, bi + int((lim_b - bi) * exp))
-        expanded_bounds.append((new_l, new_t, new_r, new_b))
+            new_l = max(lim_l, li - int((li - lim_l) * exp))
+            new_r = min(lim_r, ri_x + int((lim_r - ri_x) * exp))
+            new_t = max(lim_t, ti - int((ti - lim_t) * exp))
+            new_b = min(lim_b, bi + int((lim_b - bi) * exp))
+            expanded_bounds.append((new_l, new_t, new_r, new_b))
 
     return expanded_bounds
 
@@ -228,8 +224,35 @@ class PillowRenderer(Renderer):
         left, top, right, bottom = render_bounds if render_bounds is not None else _expand_bbox_towards_layout(region.bbox, region.layout_bbox)
         available_width = max(1, right - left - self._padding * 2)
         available_height = max(1, bottom - top - self._padding * 2)
-
         fill = self._text_color(region)
+
+        # 1. Intelligent auto-layout with sentence & paragraph formatting
+        auto_layout = TextAutoLayout(
+            region.translated_text or "",
+            orientation="horizontal",
+            font_resolver=self._font,
+        )
+        layout_res = auto_layout.find_optimal_layout(
+            available_width=available_width,
+            available_height=available_height,
+            max_font_size=min(self._max_font_size, max(self._font_size, available_height)),
+            preferred_font_size=self._font_size,
+            min_font_size=self._min_font_size,
+        )
+        if layout_res is not None and layout_res.score > 0:
+            font = self._font(layout_res.font_size)
+            cur_y = top + self._padding + (available_height - layout_res.total_height) / 2
+            for line in layout_res.line_details:
+                bounds = draw.textbbox((0, 0), line.text, font=font)
+                lw = bounds[2] - bounds[0]
+                lx = left + self._padding + (available_width - lw) / 2 - bounds[0]
+                _draw_text_with_stroke(draw, (lx, cur_y - bounds[1]), line.text, font, fill, is_multiline=False)
+                cur_y += layout_res.font_size + layout_res.line_spacing
+                if line.is_paragraph_end:
+                    cur_y += layout_res.paragraph_spacing
+            return
+
+        # Fallback to binary search
         low = self._min_font_size
         high = min(self._max_font_size, max(self._font_size, available_height))
         best_layout: tuple[str, tuple[float, float], ImageFont.FreeTypeFont] | None = None
@@ -263,6 +286,35 @@ class PillowRenderer(Renderer):
         available_width = max(1, right - left - self._padding * 2)
         available_height = max(1, bottom - top - self._padding * 2)
         vertical_text = to_vertical_text(region.translated_text or "")
+
+        # 1. Intelligent auto-layout with sentence & paragraph formatting
+        auto_layout = TextAutoLayout(
+            vertical_text,
+            orientation="vertical-rtl",
+            font_resolver=self._font,
+        )
+        layout_res = auto_layout.find_optimal_layout(
+            available_width=available_width,
+            available_height=available_height,
+            max_font_size=min(self._max_font_size, max(self._font_size, available_height)),
+            preferred_font_size=self._font_size,
+            min_font_size=self._min_font_size,
+        )
+        if layout_res is not None and layout_res.score > 0:
+            font = self._font(layout_res.font_size)
+            _draw_vertical_columns(
+                draw,
+                layout_res.lines,
+                font=font,
+                left=left,
+                top=top,
+                width=right - left,
+                height=bottom - top,
+                fill=self._text_color(region),
+            )
+            return
+
+        # Fallback to aspect-ratio vertical columns
         size = _largest_vertical_bbox_font_size(
             vertical_text,
             min(self._max_font_size, max(self._font_size, available_height)),
@@ -343,6 +395,18 @@ class MaskAwarePillowRenderer(PillowRenderer):
 
         mask = region.layout_mask.astype(np.uint8)
         layout_left, layout_top, _, _ = region.layout_bbox
+        fill = self._text_color(region)
+
+        # For vertical-rtl text with a layout mask, use the FULL mask without clipping by
+        # render_bounds. The layout_mask already defines the exact bubble shape; render_bounds
+        # is only needed to avoid text colliding with adjacent bubbles, but clipping the mask
+        # would cut off connected lobes (e.g. the lower lobe of a figure-8 bubble).
+        if self._text_direction == "vertical-rtl":
+            bx, by, bw, bh = cv2.boundingRect(mask)
+            if bw > 0 and bh > 0:
+                sub_mask = mask[by : by + bh, bx : bx + bw]
+                self._render_vertical_mask_region(draw, region, sub_mask, layout_left + bx, layout_top + by, bw, bh)
+                return
 
         if render_bounds is not None:
             target_left, target_top, target_right, target_bottom = render_bounds
@@ -366,10 +430,41 @@ class MaskAwarePillowRenderer(PillowRenderer):
         x, y, width, height = cv2.boundingRect(mask)
         mask = mask[y : y + height, x : x + width]
         left, top = layout_left, layout_top
-        fill = self._text_color(region)
-        if self._text_direction == "vertical-rtl":
-            self._render_vertical_mask_region(draw, region, mask, left + x, top + y, width, height)
-            return
+
+        # Option A for horizontal text: Try Maximum Inscribed Rectangle first
+        inscribed = find_maximum_inscribed_rectangle(mask)
+        mask_area = float(np.count_nonzero(mask))
+        if inscribed is not None and mask_area > 0:
+            rx, ry, rw, rh = inscribed
+            inscribed_ratio = (rw * rh) / mask_area
+            if inscribed_ratio >= 0.45 and rw >= self._min_font_size * 2 and rh >= self._min_font_size:
+                auto_layout = TextAutoLayout(
+                    region.translated_text or "",
+                    orientation="horizontal",
+                    font_resolver=self._font,
+                )
+                layout_res = auto_layout.find_optimal_layout(
+                    available_width=max(1, rw - self._padding * 2),
+                    available_height=max(1, rh - self._padding * 2),
+                    max_font_size=min(self._max_font_size, max(self._font_size, rh)),
+                    preferred_font_size=self._font_size,
+                    min_font_size=self._min_font_size,
+                )
+                comfortable_floor = max(self._min_font_size, int(self._font_size * 0.55))
+                if layout_res is not None and layout_res.score > 0 and layout_res.font_size >= comfortable_floor:
+                    font = self._font(layout_res.font_size)
+                    cur_y = top + ry + self._padding + (rh - self._padding * 2 - layout_res.total_height) / 2
+                    for line in layout_res.line_details:
+                        bounds = draw.textbbox((0, 0), line.text, font=font)
+                        lw = bounds[2] - bounds[0]
+                        lx = left + rx + self._padding + (rw - self._padding * 2 - lw) / 2 - bounds[0]
+                        _draw_text_with_stroke(draw, (lx, cur_y - bounds[1]), line.text, font, fill, is_multiline=False)
+                        cur_y += layout_res.font_size + layout_res.line_spacing
+                        if line.is_paragraph_end:
+                            cur_y += layout_res.paragraph_spacing
+                    return
+
+        # Fallback to mask placement
         low = self._min_font_size
         high = min(self._max_font_size, max(self._font_size, height))
         best_mask_layout: tuple[str, tuple[float, float], ImageFont.FreeTypeFont] | None = None
@@ -416,13 +511,59 @@ class MaskAwarePillowRenderer(PillowRenderer):
     ) -> None:
         anchor = _region_center(region.bbox, left, top)
         vertical_text = to_vertical_text(region.translated_text or "")
+        fill = self._text_color(region)
+
+        # Pre-segment sentences once before the layout search
+        from .layout import segment_text
+        segments = segment_text(vertical_text)
+        sentences = [s.text.strip() for s in segments if s.text.strip()]
+        if not sentences:
+            super()._render_region(draw, region)
+            return
+
+        # 1. Single-sentence standard rectangular bubble: try Maximum Inscribed Rectangle with TextAutoLayout
+        if len(sentences) == 1:
+            inscribed = find_maximum_inscribed_rectangle(mask)
+            mask_area = float(np.count_nonzero(mask))
+            if inscribed is not None and mask_area > 0:
+                rx, ry, rw, rh = inscribed
+                inscribed_ratio = (rw * rh) / mask_area
+                if inscribed_ratio >= 0.80 and rw >= self._min_font_size and rh >= self._min_font_size * 2:
+                    auto_layout = TextAutoLayout(
+                        vertical_text,
+                        orientation="vertical-rtl",
+                        font_resolver=self._font,
+                    )
+                    layout_res = auto_layout.find_optimal_layout(
+                        available_width=max(1, rw - self._padding * 2),
+                        available_height=max(1, rh - self._padding * 2),
+                        max_font_size=min(self._max_font_size, max(self._font_size, rh)),
+                        preferred_font_size=self._font_size,
+                        min_font_size=self._min_font_size,
+                    )
+                    comfortable_floor = max(self._min_font_size, int(self._font_size * 0.55))
+                    if layout_res is not None and layout_res.score > 0 and layout_res.font_size >= comfortable_floor:
+                        font = self._font(layout_res.font_size)
+                        _draw_vertical_columns(
+                            draw,
+                            layout_res.lines,
+                            font=font,
+                            left=left + rx,
+                            top=top + ry,
+                            width=rw,
+                            height=rh,
+                            fill=fill,
+                        )
+                        return
+
+        # 2. Multi-sentence / irregular / connected bubble: use Column-wise Vertical Spans inside the mask
         low = self._min_font_size
         high = min(self._max_font_size, max(self._font_size, height))
         best_vertical_layout: tuple[list[tuple[str, int, int]], int] | None = None
 
         while low <= high:
             size = (low + high) // 2
-            placements = _vertical_mask_layout(mask, vertical_text, self._font(size), self._padding, anchor)
+            placements = _vertical_mask_layout(mask, sentences, size, self._padding, anchor)
             if placements is not None:
                 best_vertical_layout = (placements, size)
                 low = size + 1
@@ -430,9 +571,22 @@ class MaskAwarePillowRenderer(PillowRenderer):
                 high = size - 1
 
         if best_vertical_layout is not None:
-            placements, size = best_vertical_layout
+            max_fitting_size = best_vertical_layout[1]
+            best_layout = best_vertical_layout
+            best_score = _score_vertical_layout(max_fitting_size, max_fitting_size, best_vertical_layout[0])
+
+            # Search nearby font sizes to avoid orphan last columns (e.g. 2nd column having only 1 character)
+            min_candidate = max(self._min_font_size, int(max_fitting_size * 0.70))
+            for cand_size in range(max_fitting_size - 1, min_candidate - 1, -1):
+                placements = _vertical_mask_layout(mask, sentences, cand_size, self._padding, anchor)
+                if placements is not None:
+                    score = _score_vertical_layout(cand_size, max_fitting_size, placements)
+                    if score > best_score:
+                        best_score = score
+                        best_layout = (placements, cand_size)
+
+            placements, size = best_layout
             font = self._font(size)
-            fill = self._text_color(region)
             for column, column_x, column_y in placements:
                 for character in column:
                     _draw_text_with_stroke(draw, (left + column_x, top + column_y), character, font, fill, is_multiline=False)
@@ -440,6 +594,74 @@ class MaskAwarePillowRenderer(PillowRenderer):
             return
 
         super()._render_region(draw, region)
+
+
+def _score_vertical_layout(size: int, max_size: int, placements: list[tuple[str, int, int]]) -> float:
+    """Score a vertical column layout based on font size and column balance.
+
+    Penalizes orphan trailing columns (e.g. only 1 or 2 characters in the last column
+    while other columns have 5+ characters) and rewards balanced column distribution
+    or fitting cleanly into a single column.
+    """
+    if not placements:
+        return -1.0
+    col_lengths = [len(p[0]) for p in placements]
+    num_cols = len(col_lengths)
+    score = 1.0 * (size / max(1, max_size))
+
+    if num_cols == 1:
+        score += 0.25
+    elif num_cols >= 2:
+        last_len = col_lengths[-1]
+        max_len = max(col_lengths)
+        min_len = min(col_lengths)
+
+        if last_len == 1 and max_len >= 3:
+            score -= 0.45
+        elif last_len == 2 and max_len >= 5:
+            score -= 0.25
+
+        balance_ratio = min_len / max(1, max_len)
+        score += 0.20 * balance_ratio
+
+    return score
+
+
+def find_maximum_inscribed_rectangle(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Find the largest axis-aligned rectangle (x, y, w, h) inside a binary mask using histogram heights."""
+    if mask.ndim != 2:
+        return None
+    h, w = mask.shape
+    if h == 0 or w == 0:
+        return None
+
+    heights = [0] * w
+    max_area = 0
+    best_rect: tuple[int, int, int, int] | None = None
+
+    for r in range(h):
+        row = mask[r]
+        for c in range(w):
+            if row[c]:
+                heights[c] += 1
+            else:
+                heights[c] = 0
+
+        stack: list[int] = []
+        for c in range(w + 1):
+            cur_h = heights[c] if c < w else 0
+            while stack and heights[stack[-1]] >= cur_h:
+                bar_h = heights[stack.pop()]
+                bar_w = c if not stack else c - stack[-1] - 1
+                area = bar_h * bar_w
+                if area > max_area:
+                    max_area = area
+                    rect_x = stack[-1] + 1 if stack else 0
+                    rect_y = r - bar_h + 1
+                    best_rect = (rect_x, rect_y, bar_w, bar_h)
+            stack.append(c)
+
+    return best_rect
 
 
 def _find_mask_placement(mask: np.ndarray, width: int, height: int, preferred_center: tuple[int, int]) -> tuple[int, int] | None:
@@ -510,161 +732,203 @@ def _largest_vertical_bbox_font_size(text: str, maximum: int, minimum: int, widt
     return best
 
 
+def _split_chars_by_capacity(chars: list[str], caps: list[int]) -> list[str] | None:
+    n = len(chars)
+    total_cap = sum(caps)
+    if total_cap < n:
+        return None
+
+    chunks: list[str] = []
+    rem_chars = n
+    rem_cap = total_cap
+    cur = 0
+
+    for j, cap in enumerate(caps):
+        if j == len(caps) - 1:
+            take = rem_chars
+        else:
+            take = max(1, round(rem_chars * cap / rem_cap))
+            take = min(take, cap)
+            rem_after_cap = sum(caps[j + 1 :])
+            if rem_chars - take > rem_after_cap:
+                take = rem_chars - rem_after_cap
+
+        if take > cap or take <= 0:
+            return None
+
+        chunks.append("".join(chars[cur : cur + take]))
+        cur += take
+        rem_chars -= take
+        rem_cap -= cap
+
+    return chunks
+
+
 def _vertical_mask_layout(
-    mask: np.ndarray, text: str, font: ImageFont.FreeTypeFont, padding: int, anchor: tuple[int, int]
+    mask: np.ndarray,
+    text_or_sentences: str | list[str],
+    font_or_size: ImageFont.FreeTypeFont | int,
+    padding: int,
+    anchor: tuple[int, int],
 ) -> list[tuple[str, int, int]] | None:
-    size = font.size
-    characters = [character for character in text if character != "\n"]
-    if not characters:
+    size = font_or_size.size if hasattr(font_or_size, "size") else int(font_or_size)
+    if isinstance(text_or_sentences, list):
+        sentences = text_or_sentences
+    else:
+        if not text_or_sentences.strip():
+            return []
+        from .layout import segment_text
+        segments = segment_text(text_or_sentences)
+        sentences = [s.text.strip() for s in segments if s.text.strip()]
+
+    if not sentences:
         return []
+
     column_ranges = _mask_column_ranges(mask, size, padding)
     if not column_ranges:
         return None
 
+    # Sort available columns from right to left (descending X for manga vertical-rtl)
     anchor_x, anchor_y = anchor
-    selected_ranges = _centered_column_ranges(column_ranges, len(characters), size, anchor_x)
-    if selected_ranges is None:
+    # Keep the best span for each unique column X
+    best_spans: dict[int, tuple[int, int]] = {}
+    for x, top, bottom in sorted(column_ranges, key=lambda c: -c[0]):
+        if (bottom - top) >= size:
+            if x not in best_spans or (bottom - top) > (best_spans[x][1] - best_spans[x][0]):
+                best_spans[x] = (top, bottom)
+
+    ordered_cols = [(x, top, bottom, (bottom - top) // size) for x, (top, bottom) in sorted(best_spans.items(), key=lambda item: -item[0])]
+    if not ordered_cols:
         return None
-    selected_ranges = _center_column_baselines(selected_ranges, font, anchor_x, mask=mask, padding=padding, anchor_y=anchor_y)
-    verified_ranges: list[tuple[int, int, int]] = []
-    for x, _, _ in selected_ranges:
-        span = _mask_vertical_span(mask, x, size, padding, anchor_y)
-        if span is None:
-            return None
-        verified_ranges.append((x, *span))
+
+    # Distribute the available columns among the sentences:
+    # 1. No two sentences ever share a column (每句話不共用同一條 column)
+    # 2. Sentences are distributed proportionally across all available columns,
+    #    so columns aren't bunched at the beginning leaving the remaining bubbles empty.
+    # 3. Long sentences occupy multiple balanced columns.
+    # 4. Each column is vertically centered in its own span.
+    m_sents = len(sentences)
+    total_cols = len(ordered_cols)
+    if total_cols < m_sents:
+        return None
+
+    # Detect natural bubble lobes/clusters by vertical overlap between adjacent columns
+    clusters: list[list[tuple[int, int, int, int]]] = [[ordered_cols[0]]]
+    for col in ordered_cols[1:]:
+        prev = clusters[-1][-1]
+        overlap = min(prev[2], col[2]) - max(prev[1], col[1])
+        if overlap >= size * 0.75:
+            clusters[-1].append(col)
+        else:
+            clusters.append([col])
+
+    # If the number of detected bubble lobes matches the number of sentences,
+    # assign each sentence strictly to its own bubble lobe!
+    if len(clusters) == m_sents:
+        groups = clusters
+    else:
+        lens = [max(1, len([c for c in s if c != "\n"])) for s in sentences]
+        total_chars = sum(lens)
+        alloc_cols: list[int] = []
+        rem_c = total_cols
+        rem_l = total_chars
+        for i, l in enumerate(lens):
+            if i == m_sents - 1:
+                c = rem_c
+            else:
+                c = max(1, round(rem_c * l / rem_l))
+                c = min(c, rem_c - (m_sents - 1 - i))
+            alloc_cols.append(c)
+            rem_c -= c
+            rem_l -= l
+
+        groups = []
+        cur = 0
+        for c in alloc_cols:
+            groups.append(ordered_cols[cur : cur + c])
+            cur += c
 
     placements: list[tuple[str, int, int]] = []
-    character_index = 0
-    ordered_ranges = list(reversed(verified_ranges))
-    for index, (x, top, bottom) in enumerate(ordered_ranges):
-        capacity = (bottom - top) // size
-        if capacity <= 0:
+
+    for i, sent in enumerate(sentences):
+        chars = [c for c in sent if c != "\n"]
+        n_chars = len(chars)
+        if n_chars == 0:
             continue
-        remaining = len(characters) - character_index
-        later_capacity = sum((range_bottom - range_top) // size for _, range_top, range_bottom in ordered_ranges[index + 1 :])
-        count = min(capacity, max((remaining + len(ordered_ranges) - index - 1) // (len(ordered_ranges) - index), remaining - later_capacity))
-        column_height = count * size
-        start = min(max(anchor_y - column_height // 2, top), bottom - column_height)
-        column = "".join(characters[character_index : character_index + count])
-        if not column:
-            break
-        placements.append((column, x, start))
-        character_index += len(column)
-        if character_index == len(characters):
-            return placements
-    return None
 
-
-def _centered_column_ranges(
-    column_ranges: list[tuple[int, int, int]], character_count: int, size: int, anchor_x: int
-) -> list[tuple[int, int, int]] | None:
-    ranges = sorted(column_ranges)
-    if not ranges:
-        return None
-
-    min_count = None
-    for count in range(1, len(ranges) + 1):
-        for index in range(len(ranges) - count + 1):
-            cand = ranges[index : index + count]
-            if sum((bottom - top) // size for _, top, bottom in cand) >= character_count:
-                min_count = count
+        group = groups[i]
+        target_center_x = (group[0][0] + group[-1][0]) / 2
+        best_cand: tuple[list[tuple[int, int, int, int]], list[str]] | None = None
+        best_score = float("inf")
+        for k in range(1, len(group) + 1):
+            for s_idx in range(len(group) - k + 1):
+                cand = group[s_idx : s_idx + k]
+                caps = [c[3] for c in cand]
+                if sum(caps) < n_chars:
+                    continue
+                chunks = _split_chars_by_capacity(chars, caps)
+                if chunks is not None:
+                    center_x = (cand[0][0] + cand[-1][0]) / 2
+                    score = abs(center_x - target_center_x)
+                    if score < best_score:
+                        best_score = score
+                        best_cand = (cand, chunks)
+            if best_cand is not None:
                 break
-        if min_count is not None:
-            break
 
-    if min_count is None:
-        return None
+        if best_cand is None:
+            return None
 
-    best_candidate: list[tuple[int, int, int]] | None = None
-    best_score = float("inf")
+        cand, chunks = best_cand
 
-    max_test_count = min(len(ranges) + 1, min_count + 4)
-    for count in range(min_count, max_test_count):
-        candidate_subsets: list[list[tuple[int, int, int]]] = []
+        # Horizontal centering: shift columns to balance left and right margins (留白對稱)
+        cand_center_x = (cand[0][0] + cand[-1][0]) / 2
+        group_center_x = (group[0][0] + group[-1][0]) / 2
+        target_shift = int(round(group_center_x - cand_center_x))
+        best_shift = 0
+        if target_shift != 0:
+            step = 1 if target_shift > 0 else -1
+            glyph_w = max(1, size - padding * 2)
+            for s in range(target_shift, 0, -step):
+                valid = True
+                for col_data, chunk in zip(cand, chunks):
+                    cx, top, bottom, _ = col_data
+                    nx = cx + s
+                    col_h = len(chunk) * size
+                    cy = top + (bottom - top - col_h) // 2
+                    if nx < 0 or nx + padding + glyph_w > mask.shape[1] or cy < 0 or cy + col_h > mask.shape[0]:
+                        valid = False
+                        break
+                    if not np.all(mask[cy : cy + col_h, nx + padding : nx + padding + glyph_w]):
+                        valid = False
+                        break
+                if valid:
+                    best_shift = s
+                    break
 
-        for index in range(len(ranges) - count + 1):
-            candidate_subsets.append(ranges[index : index + count])
+        for col_data, chunk in zip(cand, chunks):
+            x, top, bottom, _ = col_data
+            col_h = len(chunk) * size
+            # Center vertically within THIS column's own [top, bottom] span
+            start_y = top + (bottom - top - col_h) // 2
+            placements.append((chunk, x + best_shift, start_y))
 
-        if len(ranges) > count and count > 1:
-            for start in range(max(1, len(ranges) - count)):
-                for end in range(start + count, len(ranges)):
-                    indices = [int(round(start + i * (end - start) / (count - 1))) for i in range(count)]
-                    candidate_subsets.append([ranges[i] for i in indices])
-
-        for cand in candidate_subsets:
-            cap = sum((bottom - top) // size for _, top, bottom in cand)
-            if cap < character_count:
-                continue
-
-            span_width = cand[-1][0] - cand[0][0] + size
-            center = (cand[0][0] + cand[-1][0] + size) / 2
-            center_dist = abs(center - anchor_x)
-
-            score = center_dist - span_width * 0.35
-            if score < best_score:
-                best_score = score
-                best_candidate = cand
-
-    return best_candidate
-
-
-def _center_column_baselines(
-    column_ranges: list[tuple[int, int, int]],
-    font: ImageFont.FreeTypeFont,
-    anchor_x: int,
-    mask: np.ndarray | None = None,
-    padding: int = 4,
-    anchor_y: int = 0,
-) -> list[tuple[int, int, int]]:
-    size = font.size
-    center = (column_ranges[0][0] + column_ranges[-1][0] + size) / 2
-    offset = int(round(anchor_x - center))
-    if offset == 0 or mask is None:
-        return [(x + offset, top, bottom) for x, top, bottom in column_ranges]
-
-    shifted = [(x + offset, top, bottom) for x, top, bottom in column_ranges]
-    all_valid = all(_mask_vertical_span(mask, x, size, padding, anchor_y) is not None for x, _, _ in shifted)
-    if all_valid:
-        return shifted
-    return list(column_ranges)
+    return placements
 
 
 def _mask_column_ranges(mask: np.ndarray, size: int, padding: int) -> list[tuple[int, int, int]]:
     ranges: list[tuple[int, int, int]] = []
     glyph_width = max(1, size - padding * 2)
-    for x in range(padding, mask.shape[1] - size - padding + 1, size):
+    h, w = mask.shape
+    for x in range(padding, w - size - padding + 1, size):
         strip = np.all(mask[:, x + padding : x + padding + glyph_width], axis=1)
-        start = 0
-        while start < len(strip):
-            while start < len(strip) and not strip[start]:
-                start += 1
-            end = start
-            while end < len(strip) and strip[end]:
-                end += 1
-            if end - start >= size:
-                ranges.append((x, start, end))
-            start = end + 1
+        diff = np.diff(np.pad(strip.astype(np.int8), (1, 1), "constant"))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+        for s, e in zip(starts, ends):
+            if e - s >= size:
+                ranges.append((x, int(s), int(e)))
     return ranges
-
-
-def _mask_vertical_span(mask: np.ndarray, x: int, size: int, padding: int, anchor_y: int) -> tuple[int, int] | None:
-    glyph_width = max(1, size - padding * 2)
-    left, right = x + padding, x + padding + glyph_width
-    if left < 0 or right > mask.shape[1]:
-        return None
-    strip = np.all(mask[:, left:right], axis=1)
-    spans: list[tuple[int, int]] = []
-    start = 0
-    while start < len(strip):
-        while start < len(strip) and not strip[start]:
-            start += 1
-        end = start
-        while end < len(strip) and strip[end]:
-            end += 1
-        if end - start >= size:
-            spans.append((start, end))
-        start = end + 1
-    return min(spans, key=lambda span: abs((span[0] + span[1]) / 2 - anchor_y)) if spans else None
 
 
 def _draw_vertical_columns(
