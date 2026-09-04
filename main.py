@@ -26,6 +26,7 @@ from src.ocr import BaberuOCR, HybridTextBubbleDetector, MangaOCR, Manga109Bubbl
 from src.pipeline import MangaTranslationPipeline, PipelineError, draw_debug_image, save_debug_image
 from src.renderer import MaskAwarePillowRenderer, OpenCVInkAnchorDetector, PillowRenderer
 from src.translator import OllamaTranslator
+from src.translator.ollama import OllamaConnectionError
 from src.viewer import ImageViewer
 
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
@@ -363,17 +364,20 @@ def main() -> int:
                 for item, original_image, translated_image, regions, error in pipeline.process_pipelined(
                     items, cancel_event=cancel_event
                 ):
-                    if cancel_event.is_set():
-                        if arguments.debug:
-                            logging.info("Viewer closed. Cancelling remaining images.")
-                        break
-
                     if error is not None:
                         failures[0] += 1
                         logging.error("Failed to process %s\nStage: %s\nReason: %s", item.name, error.stage, error.error)
+                        if isinstance(error.error, OllamaConnectionError):
+                            cancel_event.set()
+                            break
                         if pbar:
                             pbar.update(1)
                         continue
+
+                    if cancel_event.is_set():
+                        if arguments.debug:
+                            logging.info("Viewer closed or pipeline cancelled. Cancelling remaining images.")
+                        break
 
                     if arguments.debug:
                         logging.info("[%s] %s", item.stem, item.name)

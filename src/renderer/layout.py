@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+import itertools
 import math
 import re
 from typing import Callable
+import unicodedata
 
 import cv2
 import numpy as np
@@ -18,14 +20,51 @@ class BreakPriority(IntEnum):
     PARAGRAPH = 1   # Explicit newline / paragraph separation (0 penalty)
     SENTENCE = 2    # Sentence terminal punctuation: 。！？!?…
     CLAUSE = 3      # Clause punctuation: ，、；;：:—～~
-    WORD = 4        # Space between words
-    CHAR = 5        # Character-level break (fallback when line overflows)
+    WEAK = 4        # Ambiguous symbols / weaker breaks (e.g. ~, ♡, ★)
+    WORD = 5        # Space between words
+    CHAR = 6        # Character-level break (fallback when line overflows)
 
 
-SENTENCE_TERMINALS = set("。！？!?…︙⋯‥⋮")
-CLAUSE_TERMINALS = set("，、；;：:—～~︱︲︴")
-CLOSING_PUNCTUATION = set("」』”’）)]}〕》〉﹂﹄︶︸︺︼︾﹀﹈")
-OPENING_PUNCTUATION = set("「『“‘（([{〔《〈﹁﹃︵︷︹︻︽︿﹇")
+PAIRED_OPEN_TO_CLOSE = {
+    "（": "）", "(": ")",
+    "[": "]", "［": "］",
+    "{": "}", "｛": "｝",
+    "「": "」", "『": "』",
+    "【": "】", "〖": "〗",
+    "〔": "〕", "《": "》",
+    "〈": "〉",
+    "“": "”", "‘": "’",
+    "«": "»", "‹": "›",
+    # Vertical bracket forms
+    "﹁": "﹂", "﹃": "﹄",
+    "︵": "︶", "︷": "︸",
+    "︹": "︺", "︻": "︼",
+    "︽": "︾", "︿": "﹀",
+    "﹇": "﹈",
+}
+CLOSING_BRACKETS: set[str] = set(PAIRED_OPEN_TO_CLOSE.values()) | {'"', "'"}
+OPENING_BRACKETS: set[str] = set(PAIRED_OPEN_TO_CLOSE.keys())
+
+STRONG_TERMINALS: set[str] = {
+    "。", ".", "．", "｡", "﹒",
+    "！", "!", "﹗", "︕", "¡",
+    "？", "?", "﹖", "︖", "¿", "؟",
+    "…", "︙", "⋯", "‥", "⋮",
+    "‼", "⁇", "⁈", "⁉", "‽",
+    "۔", "︒",
+}
+
+CLAUSE_PUNCTUATION: set[str] = {
+    "，", ",", "、", "﹐", "﹑", "､",
+    "；", ";", "︔", "؛",
+    "：", ":", "︓",
+    "؍",
+}
+
+SENTENCE_TERMINALS = STRONG_TERMINALS
+CLAUSE_TERMINALS = CLAUSE_PUNCTUATION | set("—～~︱︲︴")
+CLOSING_PUNCTUATION = CLOSING_BRACKETS
+OPENING_PUNCTUATION = OPENING_BRACKETS
 
 # Universal Kinsoku Shori line-breaking rules (W3C / international standards for East Asian typography)
 LINE_START_PROHIBITED = CLOSING_PUNCTUATION | SENTENCE_TERMINALS | set(
@@ -38,6 +77,32 @@ def is_latin_word_char(c: str) -> bool:
     """Return True if character is a Latin/alphanumeric word character that should not be split across lines."""
     return ("a" <= c <= "z") or ("A" <= c <= "Z") or ("0" <= c <= "9") or c in "'-_"
 
+
+def is_punct_or_symbol(c: str) -> bool:
+    """Return True if character is a punctuation or symbol character (not alphanumeric and not whitespace)."""
+    return not c.isalnum() and not c.isspace()
+
+
+def is_strong_punctuation(char: str) -> bool:
+    """Check if character is a strong sentence-ending punctuation."""
+    return char in STRONG_TERMINALS
+
+
+def is_clause_punctuation(char: str) -> bool:
+    """Check if character is a clause punctuation."""
+    return char in CLAUSE_PUNCTUATION
+
+
+def _has_trailing_strong_punct(chars: list[str]) -> bool:
+    for c in reversed(chars):
+        if c.isspace():
+            continue
+        if is_punct_or_symbol(c):
+            if is_strong_punctuation(c):
+                return True
+            continue
+        break
+    return False
 
 
 @dataclass(frozen=True)
@@ -72,7 +137,7 @@ def segment_text(text: str) -> list[TextSegment]:
             last_seg = p_segments[-1]
             p_segments[-1] = TextSegment(
                 text=last_seg.text,
-                break_after=BreakPriority.PARAGRAPH if not is_last_paragraph else BreakPriority.SENTENCE,
+                break_after=BreakPriority.PARAGRAPH if not is_last_paragraph else last_seg.break_after,
             )
             segments.extend(p_segments)
 
@@ -80,60 +145,168 @@ def segment_text(text: str) -> list[TextSegment]:
 
 
 def _segment_paragraph(text: str) -> list[TextSegment]:
-    """Segment a single paragraph by punctuation and spaces."""
+    """Segment a single paragraph by punctuation and spaces, tracking brackets and symbols."""
     segments: list[TextSegment] = []
     n = len(text)
     idx = 0
     current_chars: list[str] = []
+    bracket_stack: list[str] = []
 
     while idx < n:
         char = text[idx]
-        current_chars.append(char)
-        idx += 1
 
-        # Check for multiple consecutive dots (e.g. "..." or "..")
-        if char == "." and idx < n and text[idx] == ".":
-            while idx < n and (text[idx] in SENTENCE_TERMINALS or text[idx] in CLOSING_PUNCTUATION or text[idx] == "."):
-                current_chars.append(text[idx])
+        # 1. Check for word-internal punctuation (don't, 3.14, well-known)
+        if char in ("'", "’", "-", "‐") and (idx > 0 and is_latin_word_char(text[idx - 1])) and (idx + 1 < n and is_latin_word_char(text[idx + 1])):
+            current_chars.append(char)
+            idx += 1
+            continue
+        if char in (".", ",") and (idx > 0 and text[idx - 1].isdigit()) and (idx + 1 < n and text[idx + 1].isdigit()):
+            current_chars.append(char)
+            idx += 1
+            continue
+
+        # 2. Check bracket open/close
+        if char in PAIRED_OPEN_TO_CLOSE:
+            bracket_stack.append(PAIRED_OPEN_TO_CLOSE[char])
+            current_chars.append(char)
+            idx += 1
+            continue
+        elif char in ('"', "'"):
+            if bracket_stack and bracket_stack[-1] == char:
+                bracket_stack.pop()
+                current_chars.append(char)
                 idx += 1
+                if not bracket_stack:
+                    has_terminal = _has_trailing_strong_punct(current_chars[:-1])
+                    while idx < n and is_punct_or_symbol(text[idx]) and text[idx] not in OPENING_BRACKETS:
+                        current_chars.append(text[idx])
+                        idx += 1
+                    while idx < n and text[idx] == " ":
+                        current_chars.append(text[idx])
+                        idx += 1
+                    if has_terminal or _has_trailing_strong_punct(current_chars):
+                        segments.append(TextSegment(text="".join(current_chars), break_after=BreakPriority.SENTENCE))
+                        current_chars = []
+                continue
+            else:
+                bracket_stack.append(char)
+                current_chars.append(char)
+                idx += 1
+                continue
+        elif bracket_stack and char == bracket_stack[-1]:
+            bracket_stack.pop()
+            current_chars.append(char)
+            idx += 1
+            if not bracket_stack:
+                has_terminal = _has_trailing_strong_punct(current_chars[:-1])
+                while idx < n and is_punct_or_symbol(text[idx]) and text[idx] not in OPENING_BRACKETS:
+                    current_chars.append(text[idx])
+                    idx += 1
+                while idx < n and text[idx] == " ":
+                    current_chars.append(text[idx])
+                    idx += 1
+                if has_terminal or _has_trailing_strong_punct(current_chars):
+                    segments.append(TextSegment(text="".join(current_chars), break_after=BreakPriority.SENTENCE))
+                    current_chars = []
+            continue
+
+        # 3. If inside brackets/quotes/parentheses, ignore all punctuation
+        if len(bracket_stack) > 0:
+            current_chars.append(char)
+            idx += 1
+            continue
+
+        # 4. OUTSIDE paired brackets: check for punctuation/symbol group
+        if is_punct_or_symbol(char):
+            # Check if this punctuation/symbol group is at the start of a segment (prefix symbol like ♡呼)
+            has_content = any(c.isalnum() for c in current_chars)
+            if not has_content:
+                current_chars.append(char)
+                idx += 1
+                continue
+
+            # Preceding content present: consume the ENTIRE consecutive group of punctuation/symbols
+            group_chars: list[str] = [char]
+            idx += 1
+            while idx < n and is_punct_or_symbol(text[idx]) and text[idx] not in OPENING_BRACKETS:
+                if text[idx] in ("'", "’", "-", "‐") and (idx + 1 < n and is_latin_word_char(text[idx + 1])):
+                    break
+                if text[idx] in (".", ",") and (idx + 1 < n and text[idx + 1].isdigit()):
+                    break
+                group_chars.append(text[idx])
+                idx += 1
+
+            current_chars.extend(group_chars)
+
             while idx < n and text[idx] == " ":
                 current_chars.append(text[idx])
                 idx += 1
-            segments.append(TextSegment(text="".join(current_chars), break_after=BreakPriority.SENTENCE))
+
+            if any(is_strong_punctuation(c) for c in group_chars):
+                priority = BreakPriority.SENTENCE
+            elif any(is_clause_punctuation(c) for c in group_chars):
+                priority = BreakPriority.CLAUSE
+            else:
+                priority = BreakPriority.WEAK
+
+            segments.append(TextSegment(text="".join(current_chars), break_after=priority))
             current_chars = []
             continue
 
-        # Consume any consecutive punctuation or closing quotes attached to this segment
-        if char in SENTENCE_TERMINALS:
-            while idx < n and (text[idx] in SENTENCE_TERMINALS or text[idx] in CLOSING_PUNCTUATION or text[idx] == "."):
-                current_chars.append(text[idx])
-                idx += 1
-            # Consume following space if any
-            while idx < n and text[idx] == " ":
-                current_chars.append(text[idx])
-                idx += 1
-            segments.append(TextSegment(text="".join(current_chars), break_after=BreakPriority.SENTENCE))
-            current_chars = []
-
-        elif char in CLAUSE_TERMINALS:
-            while idx < n and (text[idx] in CLAUSE_TERMINALS or text[idx] in CLOSING_PUNCTUATION):
-                current_chars.append(text[idx])
-                idx += 1
-            while idx < n and text[idx] == " ":
-                current_chars.append(text[idx])
-                idx += 1
-            segments.append(TextSegment(text="".join(current_chars), break_after=BreakPriority.CLAUSE))
-            current_chars = []
-
-        elif char == " ":
-            # Space between words
+        # 5. Space between words
+        if char == " ":
+            current_chars.append(char)
+            idx += 1
             segments.append(TextSegment(text="".join(current_chars), break_after=BreakPriority.WORD))
             current_chars = []
+            continue
+
+        # 6. Alphanumeric character
+        current_chars.append(char)
+        idx += 1
 
     if current_chars:
         segments.append(TextSegment(text="".join(current_chars), break_after=BreakPriority.WORD))
 
     return segments
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split text into sentences, ignoring punctuation inside brackets and preferring strong punctuation over weak symbols."""
+    segments = segment_text(text)
+    if not segments:
+        return []
+
+    has_strong = any(s.break_after in (BreakPriority.PARAGRAPH, BreakPriority.SENTENCE) for s in segments)
+    has_clause = any(s.break_after == BreakPriority.CLAUSE for s in segments)
+    has_weak = any(s.break_after == BreakPriority.WEAK for s in segments)
+
+    if has_strong:
+        split_priorities = {BreakPriority.PARAGRAPH, BreakPriority.SENTENCE}
+    elif has_clause:
+        split_priorities = {BreakPriority.PARAGRAPH, BreakPriority.CLAUSE}
+    elif has_weak:
+        split_priorities = {BreakPriority.PARAGRAPH, BreakPriority.WEAK}
+    else:
+        split_priorities = {BreakPriority.PARAGRAPH}
+
+    sentences: list[str] = []
+    current: list[str] = []
+    for s in segments:
+        current.append(s.text)
+        if s.break_after in split_priorities:
+            sent = "".join(current).strip()
+            if sent:
+                sentences.append(sent)
+            current = []
+
+    if current:
+        sent = "".join(current).strip()
+        if sent:
+            sentences.append(sent)
+
+    return [s for s in sentences if s]
+
 
 
 @dataclass
@@ -198,10 +371,10 @@ class TextAutoLayout:
         if size_upper < min_font_size:
             size_upper = min_font_size
 
-        # Binary search for the optimal (largest fitting) font size
+        # 1. Binary search for the maximum fitting font size
         low = min_font_size
         high = size_upper
-        best_fitting_size: int | None = None
+        max_fitting_size: int | None = None
 
         while low <= high:
             mid = (low + high) // 2
@@ -214,18 +387,38 @@ class TextAutoLayout:
                 para_factor=0.0,
             )
             if res is not None and res.score > -50000.0:
-                best_fitting_size = mid
+                max_fitting_size = mid
                 low = mid + 1
             else:
                 high = mid - 1
 
-        if best_fitting_size is None:
-            best_fitting_size = min_font_size
+        if max_fitting_size is None:
+            max_fitting_size = min_font_size
+
+        # 2. Pick the font size with the best layout score among top candidates
+        min_eval_size = max(min_font_size, int(max_fitting_size * 0.7))
+        best_res: LayoutResult | None = None
+        best_score = float("-inf")
+        best_size = max_fitting_size
+
+        for sz in range(max_fitting_size, min_eval_size - 1, -1):
+            font = self.font_resolver(sz) if self.font_resolver else None
+            res = self._evaluate_layout_at_size(
+                font_size=sz,
+                font=font,
+                available_width=available_width,
+                available_height=available_height,
+                para_factor=0.0,
+            )
+            if res is not None and res.score > best_score:
+                best_score = res.score
+                best_res = res
+                best_size = sz
 
         # At the optimal font size, try generous paragraph spacing if space allows
-        font = self.font_resolver(best_fitting_size) if self.font_resolver else None
+        font = self.font_resolver(best_size) if self.font_resolver else None
         res_para = self._evaluate_layout_at_size(
-            font_size=best_fitting_size,
+            font_size=best_size,
             font=font,
             available_width=available_width,
             available_height=available_height,
@@ -234,8 +427,8 @@ class TextAutoLayout:
         if res_para is not None and res_para.score > -50000.0:
             return res_para
 
-        return self._evaluate_layout_at_size(
-            font_size=best_fitting_size,
+        return best_res or self._evaluate_layout_at_size(
+            font_size=best_size,
             font=font,
             available_width=available_width,
             available_height=available_height,
@@ -595,14 +788,7 @@ class TextAutoLayout:
         # 5. Sentence integrity: penalize lines that broke mid-sentence
         unbroken_sentences = sum(1 for line in lines if line.is_sentence_end or line.is_paragraph_end)
         broken_mid_sentence = len(lines) - unbroken_sentences
-        score -= broken_mid_sentence * 35.0
-
-        # 6. Latin word integrity: reject layouts where an alphanumeric word was split across lines
-        for idx in range(len(lines) - 1):
-            line_a = lines[idx].text
-            line_b = lines[idx + 1].text
-            if line_a and line_b and is_latin_word_char(line_a[-1]) and is_latin_word_char(line_b[0]):
-                return -100000.0
+        score -= broken_mid_sentence * 75.0
 
         return score
 
@@ -622,13 +808,6 @@ class TextAutoLayout:
             return -100000.0 - (overflow_w + overflow_h) * 100.0
 
         score = 0.0
-
-        # Latin word integrity: reject layouts where an alphanumeric word was split across columns
-        for idx in range(len(columns) - 1):
-            col_a = columns[idx].text
-            col_b = columns[idx + 1].text
-            if col_a and col_b and is_latin_word_char(col_a[-1]) and is_latin_word_char(col_b[0]):
-                return -100000.0
 
         # In vertical typography, short phrases (<= 3 chars, e.g. "当然", "好的") must NEVER be split
         # into multiple 1-character columns (which turns vertical text into backward horizontal RTL "然 当").
@@ -669,7 +848,7 @@ class TextAutoLayout:
         # Sentence integrity: penalize columns that broke mid-sentence
         unbroken_sentences = sum(1 for col in columns if col.is_sentence_end or col.is_paragraph_end)
         broken_mid_sentence = len(columns) - unbroken_sentences
-        score -= broken_mid_sentence * 35.0
+        score -= broken_mid_sentence * 75.0
 
         return score
 
@@ -836,31 +1015,48 @@ def _split_chars_by_capacity(chars: list[str], caps: list[int]) -> list[str] | N
     return chunks
 
 
-def _score_vertical_layout(size: int, max_size: int, placements: list[tuple[str, int, int]]) -> float:
+def _score_vertical_layout(
+    size: int,
+    max_size: int,
+    placements: list[tuple[str, int, int]],
+    num_sentences: int = 1,
+) -> float:
     if not placements:
         return -1.0
-    col_lengths = [len(p[0]) for p in placements]
-    num_cols = len(col_lengths)
-    score = 1.0 * (size / max(1, max_size))
 
-    if num_cols == 1:
-        score += 0.25
-    elif num_cols >= 2:
-        # In vertical text, never split short phrases (<= 3 chars) across multiple columns
+    num_cols = len(placements)
+    col_lengths = [len(p[0]) for p in placements]
+
+    # 1. Base font size reward (0.0 to 1.0)
+    score = float(size) / max(1, max_size)
+
+    # 2. Sentence integrity: penalize extra column breaks beyond the number of sentences
+    extra_breaks = max(0, num_cols - num_sentences)
+    score -= extra_breaks * 0.15
+
+    # 3. Word integrity: heavily penalize breaking Latin/alphanumeric words across columns
+    if extra_breaks > 0:
+        for idx in range(num_cols - 1):
+            col_a = placements[idx][0]
+            col_b = placements[idx + 1][0]
+            if col_a and col_b and is_latin_word_char(col_a[-1]) and is_latin_word_char(col_b[0]):
+                score -= 10.0
+
+    # 4. Column length balance
+    if num_cols > 1:
         if max(col_lengths) <= 1 or sum(col_lengths) <= 3:
             return -1000.0
 
-        last_len = col_lengths[-1]
         max_len = max(col_lengths)
         min_len = min(col_lengths)
+        last_len = col_lengths[-1]
 
         if last_len == 1 and max_len >= 3:
             score -= 0.45
         elif last_len == 2 and max_len >= 5:
             score -= 0.25
 
-        balance_ratio = min_len / max(1, max_len)
-        score += 0.20 * balance_ratio
+        score += 0.20 * (min_len / max(1, max_len))
 
     return score
 
@@ -964,6 +1160,7 @@ def _vertical_mask_layout(
     padding: int,
     anchor: tuple[int, int] = (0, 0),
     allow_lobe_decomposition: bool = True,
+    allow_sentence_split: bool = True,
 ) -> list[tuple[str, int, int]] | None:
     size = font_or_size.size if hasattr(font_or_size, "size") else int(font_or_size)
     if isinstance(text_or_sentences, list):
@@ -1023,6 +1220,7 @@ def _vertical_mask_layout(
                     size,
                     padding=padding,
                     allow_lobe_decomposition=False,
+                    allow_sentence_split=allow_sentence_split,
                 )
                 if sub_placements is None:
                     all_succeeded = False
@@ -1054,6 +1252,56 @@ def _vertical_mask_layout(
     m_sents = len(sentences)
     total_cols = len(ordered_cols)
     if total_cols < m_sents:
+        return None
+
+    # Phase 1: Try unbroken layout (1 column per sentence, 0 intra-sentence breaks)
+    clean_sentences = [
+        "".join(c for c in s if c != "\n") for s in sentences
+    ]
+    sent_lens = [len(s) for s in clean_sentences]
+
+    mask_ys, mask_xs = np.where(mask > 0)
+    bubble_center_x = (float(np.min(mask_xs)) + float(np.max(mask_xs))) / 2.0 if len(mask_xs) > 0 else float(ordered_cols[0][0])
+
+    best_unbroken_combo: tuple[int, ...] | None = None
+    best_unbroken_score = float("inf")
+
+    # Evaluate combinations of columns (1 per sentence): j_0 < j_1 < ... < j_{m_sents - 1}
+    min_sent_len = min(sent_lens) if sent_lens else 0
+    valid_cols = [j for j in range(total_cols) if ordered_cols[j][3] >= min_sent_len]
+    if len(valid_cols) >= m_sents:
+        for combo in itertools.combinations(valid_cols, m_sents):
+            # 1. Capacity check: each sentence must fit in its column
+            if any(ordered_cols[combo[i]][3] < sent_lens[i] for i in range(m_sents)):
+                continue
+
+            col_xs = [ordered_cols[j][0] for j in combo]
+
+            # 2. RTL spacing check: columns must not overlap (x must decrease by at least size * 0.8)
+            if any(col_xs[k] - col_xs[k + 1] < size * 0.8 for k in range(m_sents - 1)):
+                continue
+
+            combo_center_x = sum(col_xs) / m_sents
+            center_dist = abs(combo_center_x - bubble_center_x)
+            spacing_penalty = sum(abs((col_xs[k] - col_xs[k + 1]) - size * 1.1) for k in range(m_sents - 1))
+            score = center_dist * 2.0 + spacing_penalty
+
+            if score < best_unbroken_score:
+                best_unbroken_score = score
+                best_unbroken_combo = combo
+
+    if best_unbroken_combo is not None:
+        unbroken_placements: list[tuple[str, int, int]] = []
+        for i, col_idx in enumerate(best_unbroken_combo):
+            x, top, bottom, _ = ordered_cols[col_idx]
+            chunk = clean_sentences[i]
+            col_h = len(chunk) * size
+            start_y = top + (bottom - top - col_h) // 2
+            unbroken_placements.append((chunk, x, start_y))
+        return unbroken_placements
+
+    # If unbroken layout is strictly required, do not allow sentence splitting
+    if not allow_sentence_split:
         return None
 
     # Proportional column allocation
@@ -1090,13 +1338,8 @@ def _vertical_mask_layout(
         target_center_x = (group[0][0] + group[-1][0]) / 2
         best_cand: tuple[list[tuple[int, int, int, int]], list[str]] | None = None
         best_score = float("inf")
-        # Short phrases (<= 4 chars) must always stay in 1 column
-        clean_non_space = [c for c in chars if not c.isspace()]
-        if len(clean_non_space) <= 4 and any(c.isalnum() for c in clean_non_space):
-            chars = clean_non_space
-            n_chars = len(chars)
-        max_k = 1 if n_chars <= 4 else len(group)
-        for k in range(1, max_k + 1):
+        # Select best column span for this sentence (centered in group, without splitting Latin words if possible)
+        for k in range(1, len(group) + 1):
             for s_idx in range(len(group) - k + 1):
                 cand = group[s_idx : s_idx + k]
                 caps = [c[3] for c in cand]
@@ -1106,10 +1349,18 @@ def _vertical_mask_layout(
                 if chunks is not None:
                     center_x = (cand[0][0] + cand[-1][0]) / 2
                     score = abs(center_x - target_center_x)
+                    has_latin_split = any(
+                        chunks[j] and chunks[j + 1]
+                        and is_latin_word_char(chunks[j][-1])
+                        and is_latin_word_char(chunks[j + 1][0])
+                        for j in range(len(chunks) - 1)
+                    )
+                    if has_latin_split:
+                        score += 1000.0
                     if score < best_score:
                         best_score = score
                         best_cand = (cand, chunks)
-            if best_cand is not None:
+            if best_cand is not None and best_score < 500.0:
                 break
 
         if best_cand is None:

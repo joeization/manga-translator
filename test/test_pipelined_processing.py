@@ -8,6 +8,7 @@ from PIL import Image
 
 from src.models import TextRegion
 from src.pipeline import MangaTranslationPipeline, PipelineError
+from src.translator.ollama import OllamaConnectionError
 
 
 @dataclass
@@ -60,6 +61,11 @@ class _FailingOCR:
         if getattr(image, "_fail", False):
             raise RuntimeError("Corrupt image in OCR")
         return [TextRegion((0, 0, 10, 10), "ok")]
+
+
+class _ConnectionFailingTranslator:
+    def translate(self, texts: list[str], context: str | list[str] | None = None) -> list[str]:
+        raise OllamaConnectionError("CONNECTION_REFUSED")
 
 
 class PipelinedProcessingTests(unittest.TestCase):
@@ -141,7 +147,32 @@ class PipelinedProcessingTests(unittest.TestCase):
         # Should terminate quickly without processing all 10 items
         self.assertLess(len(results), 10)
 
+    def test_pipelined_aborts_immediately_on_ollama_connection_error(self) -> None:
+        pipeline = MangaTranslationPipeline(
+            _MockOCR(),
+            _ConnectionFailingTranslator(),
+            _MockInpainter(),
+            _MockRenderer(),
+            _MockAnchorDetector(),
+        )
+        cancel_event = Event()
+        items = [
+            _MockItem(f"page_{i}.jpg", f"page_{i}", "", Image.new("RGB", (20, 20)))
+            for i in range(10)
+        ]
+
+        results = list(pipeline.process_pipelined(items, cancel_event=cancel_event))
+        self.assertTrue(cancel_event.is_set())
+        self.assertGreater(len(results), 0)
+        first_err = results[0][4]
+        self.assertIsNotNone(first_err)
+        assert first_err is not None
+        self.assertEqual(first_err.stage, "translation")
+        self.assertIsInstance(first_err.error, OllamaConnectionError)
+        self.assertLess(len(results), 10)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

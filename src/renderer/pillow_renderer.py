@@ -23,6 +23,7 @@ from .layout import (
     _vertical_mask_layout,
     find_maximum_inscribed_rectangle,
     segment_text,
+    split_sentences,
 )
 
 logger = logging.getLogger(__name__)
@@ -389,8 +390,7 @@ class PillowRenderer(Renderer):
 
         # 2. Vertical rendering (Vertical-RTL)
         vertical_text = to_vertical_text(region.translated_text)
-        segments = segment_text(vertical_text)
-        sentences = [s.text.strip() for s in segments if s.text.strip()]
+        sentences = split_sentences(vertical_text)
         if not sentences:
             return
 
@@ -447,34 +447,39 @@ class PillowRenderer(Renderer):
                     return
 
         # 2b. Irregular, compound, or multi-sentence bubble: use _vertical_mask_layout
+        num_sents = len(sentences)
         low = self._min_font_size
         high = min(self._max_font_size, max(self._font_size, height))
-        best_vertical_layout: tuple[list[tuple[str, int, int]], int] | None = None
+        max_fitting_size: int | None = None
 
+        # 1. Binary search for maximum fitting font size
         while low <= high:
             size = (low + high) // 2
             placements = _vertical_mask_layout(mask, sentences, size, self._padding)
             if placements is not None:
-                best_vertical_layout = (placements, size)
+                max_fitting_size = size
                 low = size + 1
             else:
                 high = size - 1
 
-        if best_vertical_layout is not None:
-            max_fitting_size = best_vertical_layout[1]
-            best_layout = best_vertical_layout
-            best_score = _score_vertical_layout(max_fitting_size, max_fitting_size, best_vertical_layout[0])
+        if max_fitting_size is None:
+            max_fitting_size = self._min_font_size
 
-            # Search nearby font sizes to optimize column balance
-            min_candidate = max(self._min_font_size, int(max_fitting_size * 0.70))
-            for cand_size in range(max_fitting_size - 1, min_candidate - 1, -1):
-                placements = _vertical_mask_layout(mask, sentences, cand_size, self._padding)
-                if placements is not None:
-                    score = _score_vertical_layout(cand_size, max_fitting_size, placements)
-                    if score > best_score:
-                        best_score = score
-                        best_layout = (placements, cand_size)
+        # 2. Pick the layout with highest typography score in the top candidate range
+        min_eval_size = max(self._min_font_size, int(max_fitting_size * 0.7))
+        best_layout: tuple[list[tuple[str, int, int]], int] | None = None
+        best_score = float("-inf")
+        for cand_size in range(max_fitting_size, min_eval_size - 1, -1):
+            placements = _vertical_mask_layout(mask, sentences, cand_size, self._padding)
+            if placements is not None:
+                score = _score_vertical_layout(
+                    cand_size, max_fitting_size, placements, num_sentences=num_sents
+                )
+                if score > best_score:
+                    best_score = score
+                    best_layout = (placements, cand_size)
 
+        if best_layout is not None:
             placements, size = best_layout
             font = self._font(size)
             ox, oy = mask_origin

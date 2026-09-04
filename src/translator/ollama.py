@@ -16,6 +16,10 @@ class TranslationError(RuntimeError):
     """Raised when Ollama cannot return a valid entry response."""
 
 
+class OllamaConnectionError(TranslationError):
+    """Raised when the Ollama server is unreachable, refused connection, or down."""
+
+
 def _strip_code_fence(content: str) -> str:
     text = content.strip()
     if text.startswith("```"):
@@ -121,6 +125,8 @@ class OllamaTranslator(Translator):
                 clean = re.sub(r"^\s*\[?\d+\]?[\s.:：、\-—]*", "", clean).strip()
                 logger.info("Single-text translation succeeded.")
                 return [format_response(clean)]
+            except OllamaConnectionError:
+                raise
             except Exception as error:
                 logger.warning("Single-line translation failed (%s). Returning source text.", error)
                 return sanitized_texts
@@ -132,7 +138,7 @@ class OllamaTranslator(Translator):
                 context=context_str,
                 source_text=numbered_input,
                 stop=None,
-                max_tokens=max(512, len(sanitized_texts) * 128),
+                max_tokens=max(256, len(sanitized_texts) * 32),
             )
             parsed = _parse_indexed_output(content, len(sanitized_texts))
 
@@ -166,12 +172,16 @@ class OllamaTranslator(Translator):
                     clean = res_lines[0] if res_lines else single_res.strip()
                     clean = re.sub(r"^\s*\[?\d+\]?[\s.:：、\-—]*", "", clean).strip()
                     parsed[idx] = clean
+                except OllamaConnectionError:
+                    raise
                 except Exception as error:
                     logger.warning("Fallback for line %d failed: %s", idx, error)
                     parsed[idx] = sanitized_texts[idx]
 
             return [format_response(p) if p is not None else sanitized_texts[i] for i, p in enumerate(parsed)]
 
+        except OllamaConnectionError:
+            raise
         except Exception as error:
             logger.warning("Batch translation failed (%s). Falling back to line-by-line translation.", error)
 
@@ -189,6 +199,8 @@ class OllamaTranslator(Translator):
                 clean = res_lines[0] if res_lines else single_res.strip()
                 clean = re.sub(r"^\s*\[?\d+\]?[\s.:：、\-—]*", "", clean).strip()
                 fallback_results.append(format_response(clean))
+            except OllamaConnectionError:
+                raise
             except Exception as error:
                 logger.warning("Fallback request failed: %s", error)
                 fallback_results.append(format_response(text))
@@ -220,7 +232,7 @@ class OllamaTranslator(Translator):
         context: str,
         source_text: str,
         stop: list[str] | None = None,
-        max_tokens: int = 512,
+        max_tokens: int = 256,
     ) -> str:
         system_prompt = self._build_system_prompt()
         user_message = self._build_user_message(source_text, context)
@@ -250,10 +262,16 @@ class OllamaTranslator(Translator):
                 timeout=120,
             )
         except requests.RequestException as error:
+            err_str = str(error).lower()
+            if isinstance(error, (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout)) or \
+               "connection refused" in err_str or "failed to establish a new connection" in err_str or "10061" in err_str:
+                raise OllamaConnectionError(f"Ollama server connection refused at {self._endpoint}: {error}") from error
             raise TranslationError(f"Ollama request to {self._endpoint} failed: {error}") from error
 
         if not response.ok:
             body = response.text[:500]
+            if response.status_code in (502, 503):
+                raise OllamaConnectionError(f"Ollama service unavailable at {self._endpoint} (status {response.status_code}): {body}")
             raise TranslationError(f"Ollama request to {self._endpoint} failed with status {response.status_code}: {body}")
 
         if not response.text.strip():

@@ -187,6 +187,10 @@ class ImageViewer:
         root.protocol("WM_DELETE_WINDOW", lambda: _close(root, cancel_event))
 
         def poll() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                root.destroy()
+                return
+
             updated = False
             while True:
                 try:

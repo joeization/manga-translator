@@ -18,7 +18,7 @@ from src.models import OCRResult
 from src.ocr.postprocess import sort_manga_reading_order
 from src.renderer import Renderer, TextAnchorDetector
 from src.translator import Translator
-from src.translator.ollama import format_response
+from src.translator.ollama import OllamaConnectionError, format_response
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +176,9 @@ class MangaTranslationPipeline:
                 for region, translation in zip(untranslated, translations, strict=True):
                     region.translated_text = format_response(translation)
             return valid_regions, False
+        except OllamaConnectionError as error:
+            logger.error("Ollama service disconnected or closed. Aborting pipeline: %s", error)
+            raise PipelineError("translation", error) from error
         except Exception as error:
             logger.warning("Translation failed; saving the original image instead: %s", error)
             return [], True
@@ -303,6 +306,11 @@ class MangaTranslationPipeline:
                         page_translations = [r.translated_text for r in packet.regions if r.translated_text]
                         if page_translations:
                             prev_context = "\n".join(page_translations)
+                    except OllamaConnectionError as err:
+                        logger.error("Ollama service disconnected or closed. Aborting pipeline: %s", err)
+                        packet.error = PipelineError("translation", err)
+                        if cancel_event is not None:
+                            cancel_event.set()
                     except Exception as err:
                         logger.warning("Translation failed; saving the original image instead: %s", err)
                         packet.skipped_regions = packet.skipped_regions + packet.regions
@@ -322,6 +330,8 @@ class MangaTranslationPipeline:
                     q_ocr_to_inpaint.task_done()
                     break
                 if cancel_event is not None and cancel_event.is_set():
+                    packet.inpainted_image = packet.original_image
+                    q_inpaint_done.put(packet)
                     q_inpaint_done.put(None)
                     q_ocr_to_inpaint.task_done()
                     break
@@ -342,6 +352,8 @@ class MangaTranslationPipeline:
                 p_trans = q_trans_done.get()
                 p_inpaint = q_inpaint_done.get()
                 if p_trans is None or p_inpaint is None:
+                    if p_trans is not None and p_trans.error is not None:
+                        q_join_to_render.put(p_trans)
                     q_join_to_render.put(None)
                     if p_trans is not None:
                         q_trans_done.task_done()
@@ -349,6 +361,10 @@ class MangaTranslationPipeline:
                         q_inpaint_done.task_done()
                     break
                 if cancel_event is not None and cancel_event.is_set():
+                    if p_trans.error is not None or p_inpaint.error is not None:
+                        if p_inpaint.error is not None and p_trans.error is None:
+                            p_trans.error = p_inpaint.error
+                        q_join_to_render.put(p_trans)
                     q_join_to_render.put(None)
                     q_trans_done.task_done()
                     q_inpaint_done.task_done()
@@ -370,6 +386,8 @@ class MangaTranslationPipeline:
                     q_join_to_render.task_done()
                     break
                 if cancel_event is not None and cancel_event.is_set():
+                    if packet.error is not None:
+                        q_render_to_out.put(packet)
                     q_render_to_out.put(None)
                     q_join_to_render.task_done()
                     break

@@ -1,4 +1,4 @@
-Translate the following text from {{source_language}} to natural {{target_language}}.
+Translate the following manga conversation from {{source_language}} to natural {{target_language}}.
 
 Rules:
 * Output ONLY the translation: No introductions, explanations, annotations, or parentheses.
@@ -7,4 +7,4 @@ Rules:
 * Context & OCR: Use the provided context to resolve obvious OCR errors or ambiguity, but never invent meaning if it remains uncertain.
 * Punctuation Fidelity: Preserve the source text's punctuation and formatting. Do not add, remove, or duplicate punctuation unnecessarily.
 * Sounds & Symbols: Translate clear onomatopoeia/sound effects; otherwise, preserve or transliterate them.
-* Line Alignment: When translating multiple lines, output EXACTLY one translated line per input line. Maintain the exact same line count and order. NEVER merge adjacent lines, and NEVER split a translation across multiple lines.
+* Line Alignment: When translating multiple lines, output EXACTLY one translated line per input line. Maintain the exact same line count and order.

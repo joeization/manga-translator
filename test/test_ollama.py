@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.models import TextRegion
-from src.translator.ollama import OllamaTranslator, TranslationError
+from src.translator.ollama import OllamaConnectionError, OllamaTranslator, TranslationError
 
 
 class _Response:
@@ -140,6 +140,19 @@ class OllamaTranslatorTests(unittest.TestCase):
         self.assertEqual(format_response("……"), "……")
         self.assertEqual(format_response("..."), "...")
 
+    def test_ollama_connection_error_raises_immediately_without_fallback(self) -> None:
+        import requests
+        with tempfile.TemporaryDirectory() as directory:
+            prompt_path = Path(directory) / "translation.txt"
+            prompt_path.write_text("{{source_language}}>{{target_language}}\n{{context}}", encoding="utf-8")
+            client = OllamaTranslator("http://ollama", "model", "Japanese", "Traditional Chinese", prompt_path)
+
+            with patch("src.translator.ollama.requests.Session.post", side_effect=requests.exceptions.ConnectionError("CONNECTION_REFUSED")) as post:
+                with self.assertRaises(OllamaConnectionError):
+                    client.translate(["SRC_1", "SRC_2", "SRC_3"])
+                self.assertEqual(post.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+

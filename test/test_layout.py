@@ -3,12 +3,16 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+import numpy as np
 from PIL import ImageFont
 
 from src.renderer.layout import (
     BreakPriority,
     TextAutoLayout,
+    _score_vertical_layout,
+    _vertical_mask_layout,
     segment_text,
+    split_sentences,
 )
 
 
@@ -241,7 +245,111 @@ class TextLayoutTests(unittest.TestCase):
                     f"Chunk '{chunk}' split '{word}' at '{prefix}'",
                 )
 
+    def test_segment_text_bracket_ignoring_punctuation(self) -> None:
+        """Punctuation inside brackets/quotes must be ignored for segmentation."""
+        # 1. Punctuation inside quotes is not split
+        text1 = "「AAA！BBB」CCC。"
+        segs1 = segment_text(text1)
+        self.assertEqual(len(segs1), 1)
+        self.assertEqual(segs1[0].text, "「AAA！BBB」CCC。")
+        self.assertEqual(segs1[0].break_after, BreakPriority.SENTENCE)
+
+        # 2. Punctuation inside parentheses is not split
+        text2 = "（AAA，BBB？CCC）DDD。"
+        segs2 = segment_text(text2)
+        self.assertEqual(len(segs2), 1)
+        self.assertEqual(segs2[0].text, "（AAA，BBB？CCC）DDD。")
+        self.assertEqual(segs2[0].break_after, BreakPriority.SENTENCE)
+
+        # 3. Nested brackets ending in punctuation
+        text3 = "（「AAA！」）BBB。"
+        segs3 = segment_text(text3)
+        self.assertEqual(len(segs3), 2)
+        self.assertEqual(segs3[0].text, "（「AAA！」）")
+        self.assertEqual(segs3[0].break_after, BreakPriority.SENTENCE)
+        self.assertEqual(segs3[1].text, "BBB。")
+        self.assertEqual(segs3[1].break_after, BreakPriority.SENTENCE)
+
+    def test_segment_text_unicode_symbols_weak_priority(self) -> None:
+        """Unicode symbols and ambiguous punctuation outside brackets get WEAK priority."""
+        text = "AAA~ BBB♥ CCC★ DDD"
+        segs = segment_text(text)
+        # ~ is WEAK
+        self.assertEqual(segs[0].text, "AAA~ ")
+        self.assertEqual(segs[0].break_after, BreakPriority.WEAK)
+        # ♥ is WEAK
+        self.assertEqual(segs[1].text, "BBB♥ ")
+        self.assertEqual(segs[1].break_after, BreakPriority.WEAK)
+        # ★ is WEAK
+        self.assertEqual(segs[2].text, "CCC★ ")
+        self.assertEqual(segs[2].break_after, BreakPriority.WEAK)
+
+    def test_split_sentences_prefers_strong_punctuation(self) -> None:
+        """split_sentences prefers strong punctuation over weak symbols."""
+        # Strong punctuation present: weak symbols inside sentence do not split
+        sents1 = split_sentences("AAA~ BBB。")
+        self.assertEqual(sents1, ["AAA~ BBB。"])
+
+        # Punctuation inside quotes ignored: forms single sentence
+        sents2 = split_sentences("「AAA！BBB」CCC。")
+        self.assertEqual(sents2, ["「AAA！BBB」CCC。"])
+
+        # Quote ends sentence: splits into 2 sentences
+        sents3 = split_sentences("「AAA！」BBB。")
+        self.assertEqual(sents3, ["「AAA！」", "BBB。"])
+
+        # Only weak symbols present: splits at weak symbols
+        sents4 = split_sentences("AAA~ BBB~ CCC~")
+        self.assertEqual(sents4, ["AAA~", "BBB~", "CCC~"])
+
+        sents5 = split_sentences("AAA♥ BBB★ CCC")
+        self.assertEqual(sents5, ["AAA♥", "BBB★", "CCC"])
+
+        # Clause punctuation without strong punctuation
+        sents6 = split_sentences("AAA，BBB")
+        self.assertEqual(sents6, ["AAA，", "BBB"])
+
+        # Decimal numbers and apostrophes not broken
+        sents7 = split_sentences("AAA 3.14 BBB.")
+        self.assertEqual(sents7, ["AAA 3.14 BBB."])
+
+        sents8 = split_sentences("WORD1's AAA! WORD2 don't BBB.")
+        self.assertEqual(sents8, ["WORD1's AAA!", "WORD2 don't BBB."])
+
+    def test_score_vertical_layout_prefers_unbroken_sentences(self) -> None:
+        """Unbroken layout (e.g. 2 sentences in 2 columns) scores higher than 3 columns even if 3 columns has larger font."""
+        score_unbroken = _score_vertical_layout(22, 30, [("AAAAAA", 90, 10), ("BBBBBB", 60, 10)], num_sentences=2)
+        score_broken = _score_vertical_layout(26, 30, [("AAAAAA", 90, 10), ("BBB", 60, 10), ("BBB", 30, 10)], num_sentences=2)
+        self.assertGreater(score_unbroken, score_broken)
+
+    def test_vertical_mask_layout_maximizes_font_size_unbroken(self) -> None:
+        """_vertical_mask_layout keeps sentences unbroken when they fit in 1 column each."""
+        mask = np.ones((180, 120), dtype=np.uint8)
+        sentences = ["AAAAAA", "BBBBBB"]
+        placements = _vertical_mask_layout(mask, sentences, font_or_size=22, padding=4, allow_sentence_split=False)
+        self.assertIsNotNone(placements)
+        self.assertEqual(len(placements), 2)
+        self.assertEqual(placements[0][0], "AAAAAA")
+        self.assertEqual(placements[1][0], "BBBBBB")
+
+    def test_text_auto_layout_maximizes_font_size_without_intra_sentence_breaks(self) -> None:
+        """TextAutoLayout prioritizes keeping each sentence in a single vertical column without line breaks."""
+        text = "AAAAAA！BBBBBB！"
+        layout_engine = TextAutoLayout(text, orientation="vertical-rtl", font_resolver=self._font_resolver)
+        result = layout_engine.find_optimal_layout(
+            available_width=120,
+            available_height=180,
+            max_font_size=40,
+            preferred_font_size=32,
+            min_font_size=12,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result.lines), 2)
+        self.assertEqual(result.lines[0], "AAAAAA！")
+        self.assertEqual(result.lines[1], "BBBBBB！")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
