@@ -163,3 +163,78 @@ def slice_mask_to_roi(
     w = min(src.shape[1], or_ - ol)
     result[ot - rt : ot - rt + h, ol - rl : ol - rl + w] = src[:h, :w]
     return result
+
+
+class UnionFind:
+    """Disjoint-set / Union-Find data structure with path compression."""
+
+    def __init__(self, size: int) -> None:
+        self.parent = list(range(size))
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, x: int, y: int) -> None:
+        px, py = self.find(x), self.find(y)
+        if px != py:
+            self.parent[py] = px
+
+    def groups(self, active_indices: set[int] | None = None) -> dict[int, list[int]]:
+        """Return connected components grouped by root representative."""
+        res: dict[int, list[int]] = {}
+        indices = active_indices if active_indices is not None else range(len(self.parent))
+        for i in indices:
+            root = self.find(i)
+            res.setdefault(root, []).append(i)
+        return res
+
+
+def bbox_gap_2d(
+    box1: tuple[int, int, int, int],
+    box2: tuple[int, int, int, int],
+) -> tuple[int, int, float]:
+    """Calculate orthogonal horizontal gap, vertical gap, and Euclidean 2D distance between two boxes."""
+    gx = max(0, max(box1[0], box2[0]) - min(box1[2], box2[2]))
+    gy = max(0, max(box1[1], box2[1]) - min(box1[3], box2[3]))
+    return gx, gy, float(np.hypot(gx, gy))
+
+
+def partition_mask_by_centers(
+    mask: np.ndarray,
+    centers: list[tuple[float, float]],
+) -> list[tuple[tuple[int, int, int, int], np.ndarray] | None]:
+    """Partition a 2D binary mask into constituent chambers via Voronoi distance to centers.
+
+    Returns a list of ((left, top, right, bottom), cropped_chamber_mask) corresponding
+    to each center in `centers`, or None if a partition contains no mask pixels.
+    """
+    if not centers or mask.ndim != 2 or np.count_nonzero(mask) == 0:
+        return [None] * len(centers)
+
+    h_mask, w_mask = mask.shape
+    Y, X = np.ogrid[:h_mask, :w_mask]
+    dists = [np.hypot(X - cx, Y - cy) for cx, cy in centers]
+    voronoi_labels = np.argmin(np.stack(dists, axis=0), axis=0)
+
+    partitions: list[tuple[tuple[int, int, int, int], np.ndarray] | None] = []
+    for idx in range(len(centers)):
+        part_mask = ((voronoi_labels == idx) & (mask > 0)).astype(np.uint8)
+        if np.count_nonzero(part_mask) == 0:
+            partitions.append(None)
+            continue
+        ys, xs = np.where(part_mask > 0)
+        lx, ly = int(np.min(xs)), int(np.min(ys))
+        rx, by = int(np.max(xs)) + 1, int(np.max(ys)) + 1
+        partitions.append(((lx, ly, rx, by), part_mask[ly:by, lx:rx]))
+
+    return partitions
+
+
+def reading_order_sort_key(cx: float, cy: float, band_height: float) -> tuple[int, float]:
+    """Universal reading order key: top-to-bottom bands, then right-to-left."""
+    return (round(cy / band_height), -cx)
+
+

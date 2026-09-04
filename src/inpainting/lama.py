@@ -16,7 +16,7 @@ from PIL import Image
 from src.models import TextRegion
 
 from .base import Inpainter
-from .utils import estimate_adaptive_dilation, estimate_ink_color, slice_mask_to_roi
+from .utils import UnionFind, estimate_adaptive_dilation, estimate_ink_color, slice_mask_to_roi
 
 logger = logging.getLogger(__name__)
 
@@ -147,13 +147,24 @@ class LamaInpainter(Inpainter):
         roi_clusters = _cluster_bboxes(valid_bboxes, margin=48, img_w=w, img_h=h)
         logger.info("LaMa: running neural inpainting on %d regions across %d ROI clusters", len(valid_bboxes), len(roi_clusters))
 
+        # Collect active ROI clusters for high-resolution patch inpainting
+        active_clusters: list[tuple[tuple[int, int, int, int], np.ndarray, np.ndarray]] = []
         for crop_l, crop_t, crop_r, crop_b in roi_clusters:
-            crop_img = img_rgb[crop_t:crop_b, crop_l:crop_r]
             crop_mask = full_mask[crop_t:crop_b, crop_l:crop_r]
-            if not np.any(crop_mask):
-                continue
+            if np.any(crop_mask):
+                crop_img = img_rgb[crop_t:crop_b, crop_l:crop_r]
+                active_clusters.append(((crop_l, crop_t, crop_r, crop_b), crop_img, crop_mask))
 
-            inpainted_crop = self._run_onnx_patch(crop_img, crop_mask)
+        if not active_clusters:
+            return Image.fromarray(output_pixels, mode="RGB")
+
+        # Batched neural inpainting on GPU
+        inpainted_crops = self._run_onnx_patches(
+            [c[1] for c in active_clusters],
+            [c[2] for c in active_clusters],
+        )
+
+        for ((crop_l, crop_t, crop_r, crop_b), _, crop_mask), inpainted_crop in zip(active_clusters, inpainted_crops):
             mask_bool = crop_mask > 0
             output_pixels[crop_t:crop_b, crop_l:crop_r][mask_bool] = inpainted_crop[mask_bool]
 
@@ -161,37 +172,59 @@ class LamaInpainter(Inpainter):
 
     def _run_onnx_patch(self, image_patch: np.ndarray, mask_patch: np.ndarray) -> np.ndarray:
         """Run GPU ONNX Runtime inpainting on an ROI patch."""
-        patch_h, patch_w = image_patch.shape[:2]
+        return self._run_onnx_patches([image_patch], [mask_patch])[0]
 
-        resized_img = cv2.resize(image_patch, (512, 512), interpolation=cv2.INTER_AREA)
-        resized_mask = cv2.resize(mask_patch, (512, 512), interpolation=cv2.INTER_NEAREST)
+    def _run_onnx_patches(
+        self,
+        image_patches: list[np.ndarray],
+        mask_patches: list[np.ndarray],
+        max_batch_size: int = 8,
+    ) -> list[np.ndarray]:
+        """Run GPU ONNX Runtime inpainting on multiple ROI patches using batched inference."""
+        if not image_patches:
+            return []
 
-        img_f = resized_img.astype(np.float32) / 255.0
-        img_chw = np.transpose(img_f, (2, 0, 1))[np.newaxis, ...]
+        results: list[np.ndarray] = []
+        n = len(image_patches)
 
-        mask_bin = (resized_mask > 127).astype(np.float32)
-        mask_chw = mask_bin[np.newaxis, np.newaxis, ...]
+        for batch_start in range(0, n, max_batch_size):
+            batch_end = min(n, batch_start + max_batch_size)
+            batch_imgs_raw = image_patches[batch_start:batch_end]
+            batch_masks_raw = mask_patches[batch_start:batch_end]
+            b_size = len(batch_imgs_raw)
 
-        feeds = {}
-        for name in self._input_names:
-            if "mask" in name.lower() or name == self._input_names[1]:
-                feeds[name] = mask_chw.astype(np.float32)
-            else:
-                feeds[name] = img_chw.astype(np.float32)
+            batch_imgs = np.empty((b_size, 3, 512, 512), dtype=np.float32)
+            batch_masks = np.empty((b_size, 1, 512, 512), dtype=np.float32)
 
-        out = self.session.run(self._output_names, feeds)
-        result = out[0]
+            for i in range(b_size):
+                r_img = cv2.resize(batch_imgs_raw[i], (512, 512), interpolation=cv2.INTER_AREA)
+                r_mask = cv2.resize(batch_masks_raw[i], (512, 512), interpolation=cv2.INTER_NEAREST)
 
-        if result.ndim == 4:
-            result = result[0]
-        if result.shape[0] == 3:
-            result = np.transpose(result, (1, 2, 0))
+                img_f = r_img.astype(np.float32) / 255.0
+                batch_imgs[i] = np.transpose(img_f, (2, 0, 1))
+                batch_masks[i, 0] = (r_mask > 127).astype(np.float32)
 
-        if result.max() <= 1.0:
-            result = result * 255.0
+            feeds = {}
+            for name in self._input_names:
+                if "mask" in name.lower() or name == self._input_names[1]:
+                    feeds[name] = batch_masks
+                else:
+                    feeds[name] = batch_imgs
 
-        out_uint8 = np.clip(np.round(result), 0, 255).astype(np.uint8)
-        return cv2.resize(out_uint8, (patch_w, patch_h), interpolation=cv2.INTER_CUBIC)
+            out = self.session.run(self._output_names, feeds)
+            batch_out = out[0]
+
+            for i in range(b_size):
+                patch_h, patch_w = batch_imgs_raw[i].shape[:2]
+                res_i = batch_out[i]
+                if res_i.shape[0] == 3:
+                    res_i = np.transpose(res_i, (1, 2, 0))
+                if res_i.max() <= 1.0:
+                    res_i = res_i * 255.0
+                out_uint8 = np.clip(np.round(res_i), 0, 255).astype(np.uint8)
+                results.append(cv2.resize(out_uint8, (patch_w, patch_h), interpolation=cv2.INTER_CUBIC))
+
+        return results
 
 
 def _is_flat_background(
@@ -367,26 +400,35 @@ def _cluster_bboxes(
     if not bboxes:
         return []
 
-    merged = [
+    clusters = [
         (max(0, l - margin), max(0, t - margin), min(img_w, r + margin), min(img_h, b + margin))
         for l, t, r, b in bboxes
     ]
 
     while True:
-        changed = False
-        new_merged: list[tuple[int, int, int, int]] = []
-        for cur_l, cur_t, cur_r, cur_b in merged:
-            placed = False
-            for idx, (ml, mt, mr, mb) in enumerate(new_merged):
-                if max(cur_l, ml) < min(cur_r, mr) and max(cur_t, mt) < min(cur_b, mb):
-                    new_merged[idx] = (min(cur_l, ml), min(cur_t, mt), max(cur_r, mr), max(cur_b, mb))
-                    placed = True
-                    changed = True
-                    break
-            if not placed:
-                new_merged.append((cur_l, cur_t, cur_r, cur_b))
-        merged = new_merged
-        if not changed:
+        n = len(clusters)
+        if n <= 1:
+            break
+        uf = UnionFind(n)
+        has_merge = False
+        for i in range(n):
+            il, it, ir, ib = clusters[i]
+            for j in range(i + 1, n):
+                jl, jt, jr, jb = clusters[j]
+                if max(il, jl) < min(ir, jr) and max(it, jt) < min(ib, jb):
+                    uf.union(i, j)
+                    has_merge = True
+
+        if not has_merge:
             break
 
-    return merged
+        new_clusters: list[tuple[int, int, int, int]] = []
+        for g_idxs in uf.groups().values():
+            gl = min(clusters[i][0] for i in g_idxs)
+            gt = min(clusters[i][1] for i in g_idxs)
+            gr = max(clusters[i][2] for i in g_idxs)
+            gb = max(clusters[i][3] for i in g_idxs)
+            new_clusters.append((gl, gt, gr, gb))
+        clusters = new_clusters
+
+    return clusters

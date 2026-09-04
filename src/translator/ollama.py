@@ -107,87 +107,91 @@ class OllamaTranslator(Translator):
         # Normalize texts: replace internal newlines within a single bubble so each is on one line
         sanitized_texts = [text.replace("\n", " ").strip() for text in texts]
 
-        # 1. Attempt whole-page translation with previous page context
+        # 1. Single text: direct translation without numbering
+        if len(sanitized_texts) == 1:
+            try:
+                content = self._request(
+                    context=context_str,
+                    source_text=sanitized_texts[0],
+                    stop=None,
+                    max_tokens=256,
+                )
+                lines = [line.strip() for line in content.splitlines() if line.strip() and line.strip().lower() not in ("user", "assistant", "system")]
+                clean = lines[0] if lines else content.strip()
+                clean = re.sub(r"^\s*\[?\d+\]?[\s.:：、\-—]*", "", clean).strip()
+                logger.info("Single-text translation succeeded.")
+                return [format_response(clean)]
+            except Exception as error:
+                logger.warning("Single-line translation failed (%s). Returning source text.", error)
+                return sanitized_texts
+
+        # 2. Multi-text batch: use numbered indexing [1] ... [N] for strict boundary alignment
         try:
-            whole_input = "\n".join(sanitized_texts)
+            numbered_input = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(sanitized_texts))
             content = self._request(
                 context=context_str,
-                source_text=whole_input,
+                source_text=numbered_input,
                 stop=None,
                 max_tokens=max(512, len(sanitized_texts) * 128),
             )
-            lines = [line.strip() for line in content.splitlines() if line.strip()]
-            if lines and lines[0].lower() in ("user", "assistant", "system"):
-                lines = lines[1:]
+            parsed = _parse_indexed_output(content, len(sanitized_texts))
 
-            if len(lines) == len(sanitized_texts):
-                logger.info("Whole-page translation succeeded (%d lines).", len(lines))
-                return [format_response(l) for l in lines]
+            # Fallback for models that output plain un-indexed lines with matching count
+            if not all(p is not None and p.strip() for p in parsed):
+                plain_lines = [
+                    line.strip() for line in content.splitlines()
+                    if line.strip() and line.strip().lower() not in ("user", "assistant", "system")
+                ]
+                if len(plain_lines) == len(sanitized_texts):
+                    parsed = [re.sub(r"^\s*\[?\d+\]?[\s.:：、\-—]*", "", l).strip() for l in plain_lines]
 
-            # Also check if model produced indexed lines [1], [2] etc.
-            indexed_try = _parse_indexed_output(content, len(sanitized_texts))
-            if all(r is not None and r.strip() for r in indexed_try):
-                logger.info("Whole-page indexed translation succeeded (%d lines).", len(indexed_try))
-                return [format_response(r.strip()) for r in indexed_try if r is not None]
+            # If all lines succeeded
+            if all(p is not None and p.strip() for p in parsed):
+                logger.info("Batch translation succeeded (%d lines).", len(parsed))
+                return [format_response(p.strip()) for p in parsed if p is not None]
 
-            logger.warning(
-                "Whole-page translation returned %d lines, expected %d. Falling back to single-sentence translation without context.",
-                len(lines),
-                len(sanitized_texts),
-            )
+            # If only a few lines are missing, translate only the missing lines individually
+            missing_indices = [i for i, p in enumerate(parsed) if p is None or not p.strip()]
+            logger.info("Batch translation recovered %d of %d lines, translating %d missing lines individually.",
+                        len(sanitized_texts) - len(missing_indices), len(sanitized_texts), len(missing_indices))
+            for idx in missing_indices:
+                try:
+                    single_res = self._request(
+                        context="",
+                        source_text=sanitized_texts[idx],
+                        stop=["\n"],
+                        max_tokens=256,
+                    )
+                    res_lines = [l.strip() for l in single_res.splitlines() if l.strip()]
+                    clean = res_lines[0] if res_lines else single_res.strip()
+                    clean = re.sub(r"^\s*\[?\d+\]?[\s.:：、\-—]*", "", clean).strip()
+                    parsed[idx] = clean
+                except Exception as error:
+                    logger.warning("Fallback for line %d failed: %s", idx, error)
+                    parsed[idx] = sanitized_texts[idx]
+
+            return [format_response(p) if p is not None else sanitized_texts[i] for i, p in enumerate(parsed)]
+
         except Exception as error:
-            logger.warning(
-                "Whole-page translation failed (%s). Falling back to single-sentence translation without context.",
-                error,
-            )
+            logger.warning("Batch translation failed (%s). Falling back to line-by-line translation.", error)
 
-        # 2. Fast numbered batch attempt when there are multiple dialogues (> 2)
-        if len(sanitized_texts) > 2:
-            try:
-                numbered_input = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(sanitized_texts))
-                content = self._request(
-                    context=context_str,
-                    source_text=numbered_input,
-                    stop=None,
-                    max_tokens=max(512, len(sanitized_texts) * 128),
-                )
-                parsed = _parse_indexed_output(content, len(sanitized_texts))
-                if all(p is not None and p.strip() for p in parsed):
-                    logger.info("Numbered batch translation succeeded (%d lines).", len(parsed))
-                    return [format_response(p.strip()) for p in parsed if p is not None]
-
-                missing_indices = [i for i, p in enumerate(parsed) if p is None or not p.strip()]
-                if len(missing_indices) < len(sanitized_texts) // 2:
-                    logger.info("Numbered batch recovered %d of %d lines, translating %d missing lines individually.",
-                                len(sanitized_texts) - len(missing_indices), len(sanitized_texts), len(missing_indices))
-                    for idx in missing_indices:
-                        single_res = self._request(
-                            context="",
-                            source_text=sanitized_texts[idx],
-                            stop=["\n"],
-                            max_tokens=256,
-                        )
-                        res_lines = [l.strip() for l in single_res.splitlines() if l.strip()]
-                        clean = res_lines[0] if res_lines else single_res.strip()
-                        clean = re.sub(r"^\s*\[?\d+\]?[\s.:：、\-—]*", "", clean).strip()
-                        parsed[idx] = clean
-                    return [format_response(p) if p is not None else sanitized_texts[i] for i, p in enumerate(parsed)]
-            except Exception as error:
-                logger.warning("Numbered batch attempt failed (%s). Falling back to line-by-line translation.", error)
-
-        # 3. Fallback: translate line by line without context
+        # 3. Complete fallback: translate line by line without context
         fallback_results: list[str] = []
         for text in sanitized_texts:
-            single_res = self._request(
-                context="",
-                source_text=text,
-                stop=["\n"],
-                max_tokens=256,
-            )
-            res_lines = [l.strip() for l in single_res.splitlines() if l.strip()]
-            clean = res_lines[0] if res_lines else single_res.strip()
-            clean = re.sub(r"^\s*\[?\d+\]?[\s.:：、\-—]*", "", clean).strip()
-            fallback_results.append(format_response(clean))
+            try:
+                single_res = self._request(
+                    context="",
+                    source_text=text,
+                    stop=["\n"],
+                    max_tokens=256,
+                )
+                res_lines = [l.strip() for l in single_res.splitlines() if l.strip()]
+                clean = res_lines[0] if res_lines else single_res.strip()
+                clean = re.sub(r"^\s*\[?\d+\]?[\s.:：、\-—]*", "", clean).strip()
+                fallback_results.append(format_response(clean))
+            except Exception as error:
+                logger.warning("Fallback request failed: %s", error)
+                fallback_results.append(format_response(text))
 
         return fallback_results
 

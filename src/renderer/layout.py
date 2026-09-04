@@ -6,7 +6,11 @@ import math
 import re
 from typing import Callable
 
+import cv2
+import numpy as np
 from PIL import ImageFont
+
+from src.inpainting.utils import partition_mask_by_centers, reading_order_sort_key
 
 
 class BreakPriority(IntEnum):
@@ -23,7 +27,6 @@ CLAUSE_TERMINALS = set("，、；;：:—～~︱︲︴")
 CLOSING_PUNCTUATION = set("」』”’）)]}〕》〉﹂﹄︶︸︺︼︾﹀﹈")
 OPENING_PUNCTUATION = set("「『“‘（([{〔《〈﹁﹃︵︷︹︻︽︿﹇")
 
-# Universal Kinsoku Shori rules (JIS X 4051 / W3C Requirements for Chinese & Japanese Text Layout)
 # Universal Kinsoku Shori line-breaking rules (W3C / international standards for East Asian typography)
 LINE_START_PROHIBITED = CLOSING_PUNCTUATION | SENTENCE_TERMINALS | set(
     "，、；;：:,.…︙︱︲︴—―-~～ーｰぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮ"
@@ -625,4 +628,403 @@ class TextAutoLayout:
         score -= broken_mid_sentence * 35.0
 
         return score
+
+
+def find_maximum_inscribed_rectangle(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Find the largest axis-aligned rectangle (x, y, w, h) inside a binary mask using histogram heights."""
+    if mask.ndim != 2:
+        return None
+    h, w = mask.shape
+    if h == 0 or w == 0:
+        return None
+
+    heights = [0] * w
+    max_area = 0
+    best_rect: tuple[int, int, int, int] | None = None
+
+    for r in range(h):
+        row = mask[r]
+        for c in range(w):
+            if row[c]:
+                heights[c] += 1
+            else:
+                heights[c] = 0
+
+        stack: list[int] = []
+        for c in range(w + 1):
+            cur_h = heights[c] if c < w else 0
+            while stack and heights[stack[-1]] >= cur_h:
+                bar_h = heights[stack.pop()]
+                bar_w = c if not stack else c - stack[-1] - 1
+                area = bar_h * bar_w
+                if area > max_area:
+                    max_area = area
+                    rect_x = stack[-1] + 1 if stack else 0
+                    rect_y = r - bar_h + 1
+                    best_rect = (rect_x, rect_y, bar_w, bar_h)
+            stack.append(c)
+
+    return best_rect
+
+
+def _mask_column_ranges(mask: np.ndarray, size: int, padding: int) -> list[tuple[int, int, int]]:
+    ranges: list[tuple[int, int, int]] = []
+    glyph_width = max(1, size - padding * 2)
+    h, w = mask.shape
+    for x in range(padding, w - size - padding + 1, size):
+        strip = np.all(mask[:, x + padding : x + padding + glyph_width], axis=1)
+        diff = np.diff(np.pad(strip.astype(np.int8), (1, 1), "constant"))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+        for start, end in zip(starts, ends):
+            if end - start >= size:
+                ranges.append((x, int(start), int(end)))
+    return ranges
+
+
+def _split_chars_by_capacity(chars: list[str], caps: list[int]) -> list[str] | None:
+    if sum(caps) < len(chars):
+        return None
+    k = len(caps)
+    if k == 0:
+        return None
+    if k == 1:
+        return ["".join(chars)] if caps[0] >= len(chars) else None
+
+    # In vertical layout, never split short phrases (<= 3 chars) across multiple columns
+    if len(chars) <= 3 and k > 1:
+        return None
+
+    # Evenly distribute characters across columns without exceeding any column's capacity
+    chunks: list[str] = []
+    cur = 0
+    rem_chars = len(chars)
+    rem_cap = sum(caps)
+
+    for i in range(k):
+        cap = caps[i]
+        rem_cols = k - i
+        ideal = round(rem_chars / rem_cols)
+        take = min(cap, ideal)
+        rem_after_cap = rem_cap - cap
+        if rem_chars - take > rem_after_cap:
+            take = rem_chars - rem_after_cap
+
+        if take > cap or take <= 0:
+            return None
+
+        chunks.append("".join(chars[cur : cur + take]))
+        cur += take
+        rem_chars -= take
+        rem_cap -= cap
+
+    return chunks
+
+
+def _score_vertical_layout(size: int, max_size: int, placements: list[tuple[str, int, int]]) -> float:
+    if not placements:
+        return -1.0
+    col_lengths = [len(p[0]) for p in placements]
+    num_cols = len(col_lengths)
+    score = 1.0 * (size / max(1, max_size))
+
+    if num_cols == 1:
+        score += 0.25
+    elif num_cols >= 2:
+        # In vertical text, never split short phrases (<= 3 chars) across multiple columns
+        if max(col_lengths) <= 1 or sum(col_lengths) <= 3:
+            return -1000.0
+
+        last_len = col_lengths[-1]
+        max_len = max(col_lengths)
+        min_len = min(col_lengths)
+
+        if last_len == 1 and max_len >= 3:
+            score -= 0.45
+        elif last_len == 2 and max_len >= 5:
+            score -= 0.25
+
+        balance_ratio = min_len / max(1, max_len)
+        score += 0.20 * balance_ratio
+
+    return score
+
+
+def detect_bubble_lobes(mask: np.ndarray, min_radius: float = 12.0) -> list[dict[str, object]]:
+    """Decompose an arbitrary binary bubble mask into N natural constituent lobes/chambers.
+
+    Uses Euclidean Distance Transform (EDT) and local peak clustering to discover
+    the natural geometric centers and inscribed radii of all constituent bubble lobes.
+    """
+    if mask.ndim != 2 or np.count_nonzero(mask) == 0:
+        return []
+
+    dist = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
+    max_d = float(np.max(dist))
+    if max_d < min_radius:
+        ys, xs = np.where(mask > 0)
+        return [{
+            "center": (int(np.mean(xs)), int(np.mean(ys))),
+            "radius": max_d,
+            "bbox": (int(np.min(xs)), int(np.min(ys)), int(np.max(xs)) + 1, int(np.max(ys)) + 1),
+            "mask": mask,
+        }]
+
+    ksize = max(15, int(min_radius * 1.5))
+    if ksize % 2 == 0:
+        ksize += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    dilated = cv2.dilate(dist, kernel)
+
+    peak_mask = (dist == dilated) & (dist >= min_radius)
+    ys, xs = np.where(peak_mask)
+    if len(xs) == 0:
+        max_y, max_x = np.unravel_index(np.argmax(dist), dist.shape)
+        xs, ys = np.array([max_x]), np.array([max_y])
+
+    candidates = sorted([(int(x), int(y), float(dist[y, x])) for x, y in zip(xs, ys)], key=lambda p: -p[2])
+
+    suppressed_peaks: list[tuple[int, int, float]] = []
+    for x, y, r in candidates:
+        is_distinct = True
+        for ex, ey, er in suppressed_peaks:
+            d = np.hypot(x - ex, y - ey)
+            if d < 0.70 * min(r, er):
+                is_distinct = False
+                break
+            # Geometric constriction (neck) check:
+            # Two peaks are distinct lobes IF AND ONLY IF there is a constriction (isthmus/neck)
+            # along the path between them where the distance to the boundary drops significantly.
+            # If the path between them remains wide (no constriction), they are part of the SAME
+            # continuous elongated chamber and must not be sliced into separate lobes.
+            num_samples = max(10, int(d))
+            s_xs = np.clip(np.linspace(x, ex, num_samples).round().astype(int), 0, mask.shape[1] - 1)
+            s_ys = np.clip(np.linspace(y, ey, num_samples).round().astype(int), 0, mask.shape[0] - 1)
+            min_path_d = float(np.min(dist[s_ys, s_xs]))
+            if min_path_d >= 0.72 * min(r, er):
+                is_distinct = False
+                break
+        if is_distinct:
+            suppressed_peaks.append((x, y, r))
+
+    if len(suppressed_peaks) <= 1:
+        ys, xs = np.where(mask > 0)
+        cx, cy, r = suppressed_peaks[0] if suppressed_peaks else (int(np.mean(xs)), int(np.mean(ys)), max_d)
+        return [{
+            "center": (cx, cy),
+            "radius": r,
+            "bbox": (int(np.min(xs)), int(np.min(ys)), int(np.max(xs)) + 1, int(np.max(ys)) + 1),
+            "mask": mask,
+        }]
+
+    # Multi-lobe Voronoi chamber partition
+    partitions = partition_mask_by_centers(mask, [(float(px), float(py)) for px, py, _ in suppressed_peaks])
+    lobes: list[dict[str, object]] = []
+    for idx, (px, py, pr) in enumerate(suppressed_peaks):
+        part = partitions[idx]
+        if part is None:
+            continue
+        (lx, ly, rx, by), cropped_lobe = part
+        lobe_mask = np.zeros_like(mask, dtype=np.uint8)
+        lobe_mask[ly:by, lx:rx] = cropped_lobe
+        lobes.append({
+            "center": (px, py),
+            "radius": pr,
+            "bbox": (lx, ly, rx, by),
+            "mask": lobe_mask,
+        })
+
+    # Sort lobes in vertical-RTL reading order: top-to-bottom bands, then right-to-left
+    avg_r = float(np.mean([float(l["radius"]) for l in lobes]))
+    band_h = max(20.0, avg_r * 1.5)
+    lobes.sort(key=lambda l: reading_order_sort_key(l["center"][0], l["center"][1], band_h))
+
+    return lobes
+
+
+def _vertical_mask_layout(
+    mask: np.ndarray,
+    text_or_sentences: str | list[str],
+    font_or_size: ImageFont.FreeTypeFont | int,
+    padding: int,
+    anchor: tuple[int, int] = (0, 0),
+    allow_lobe_decomposition: bool = True,
+) -> list[tuple[str, int, int]] | None:
+    size = font_or_size.size if hasattr(font_or_size, "size") else int(font_or_size)
+    if isinstance(text_or_sentences, list):
+        sentences = text_or_sentences
+    else:
+        if not text_or_sentences.strip():
+            return []
+        segments = segment_text(text_or_sentences)
+        sentences = [s.text.strip() for s in segments if s.text.strip()]
+
+    if not sentences:
+        return []
+
+    # 1. Multi-lobe compound bubble decomposition (Distance Transform Local Maxima & Watershed)
+    if allow_lobe_decomposition and len(sentences) >= 2:
+        lobes = detect_bubble_lobes(mask, min_radius=max(12.0, float(size) * 0.6))
+        if len(lobes) >= 2:
+            n_lobes = len(lobes)
+            m_sents = len(sentences)
+            if m_sents <= n_lobes:
+                sents_per_lobe = [[sentences[i]] if i < m_sents else [] for i in range(n_lobes)]
+            else:
+                lobe_areas = [max(1.0, float(np.count_nonzero(l["mask"]))) for l in lobes]
+                total_area = sum(lobe_areas)
+                sent_lens = [max(1, len([c for c in s if not c.isspace()])) for s in sentences]
+                total_chars = sum(sent_lens)
+
+                sents_per_lobe = [[] for _ in range(n_lobes)]
+                curr_l = 0
+                curr_chars = 0
+                target_chars = total_chars * (lobe_areas[0] / total_area)
+
+                for s_idx, s in enumerate(sentences):
+                    s_len = sent_lens[s_idx]
+                    rem_sents = len(sentences) - s_idx
+                    rem_lobes = n_lobes - curr_l
+                    if curr_l < n_lobes - 1:
+                        if curr_chars > 0 and (curr_chars + s_len * 0.5 > target_chars) and rem_sents >= rem_lobes:
+                            curr_l += 1
+                            curr_chars = 0
+                            target_chars = total_chars * (lobe_areas[curr_l] / total_area)
+                    sents_per_lobe[curr_l].append(s)
+                    curr_chars += s_len
+
+            placements: list[tuple[str, int, int]] = []
+            all_succeeded = True
+            for lobe_idx, lobe in enumerate(lobes):
+                lobe_sents = sents_per_lobe[lobe_idx]
+                if not lobe_sents:
+                    continue
+                lobe_mask = lobe["mask"]
+                lx, ly, rx, by = lobe["bbox"]
+                cropped_mask = lobe_mask[ly:by, lx:rx]
+                sub_placements = _vertical_mask_layout(
+                    cropped_mask,
+                    lobe_sents,
+                    size,
+                    padding=padding,
+                    allow_lobe_decomposition=False,
+                )
+                if sub_placements is None:
+                    all_succeeded = False
+                    break
+                for chunk, cx, cy in sub_placements:
+                    placements.append((chunk, lx + cx, ly + cy))
+
+            if all_succeeded and placements:
+                return placements
+
+    # 2. Single-lobe or unified bubble layout
+    column_ranges = _mask_column_ranges(mask, size, padding)
+    if not column_ranges:
+        return None
+
+    # Keep the best span for each unique column X
+    best_spans: dict[int, tuple[int, int]] = {}
+    for x, top, bottom in sorted(column_ranges, key=lambda c: -c[0]):
+        if (bottom - top) >= size:
+            if x not in best_spans or (bottom - top) > (best_spans[x][1] - best_spans[x][0]):
+                best_spans[x] = (top, bottom)
+
+    raw_cols = [(x, top, bottom, (bottom - top) // size) for x, (top, bottom) in best_spans.items()]
+    if not raw_cols:
+        return None
+
+    ordered_cols = sorted(raw_cols, key=lambda c: -c[0])
+
+    m_sents = len(sentences)
+    total_cols = len(ordered_cols)
+    if total_cols < m_sents:
+        return None
+
+    # Proportional column allocation
+    lens = [max(1, len([c for c in s if c != "\n"])) for s in sentences]
+    total_chars = sum(lens)
+    alloc_cols: list[int] = []
+    rem_c = total_cols
+    rem_l = total_chars
+    for i, l in enumerate(lens):
+        if i == m_sents - 1:
+            c = rem_c
+        else:
+            c = max(1, round(rem_c * l / rem_l))
+            c = min(c, rem_c - (m_sents - 1 - i))
+        alloc_cols.append(c)
+        rem_c -= c
+        rem_l -= l
+
+    groups: list[list[tuple[int, int, int, int]]] = []
+    cur = 0
+    for c in alloc_cols:
+        groups.append(ordered_cols[cur : cur + c])
+        cur += c
+
+    placements: list[tuple[str, int, int]] = []
+
+    for i, sent in enumerate(sentences):
+        chars = [c for c in sent if c != "\n"]
+        n_chars = len(chars)
+        if n_chars == 0:
+            continue
+
+        group = groups[i]
+        target_center_x = (group[0][0] + group[-1][0]) / 2
+        best_cand: tuple[list[tuple[int, int, int, int]], list[str]] | None = None
+        best_score = float("inf")
+        # Short phrases (<= 3 chars) must always stay in 1 column
+        max_k = 1 if n_chars <= 3 else len(group)
+        for k in range(1, max_k + 1):
+            for s_idx in range(len(group) - k + 1):
+                cand = group[s_idx : s_idx + k]
+                caps = [c[3] for c in cand]
+                if sum(caps) < n_chars:
+                    continue
+                chunks = _split_chars_by_capacity(chars, caps)
+                if chunks is not None:
+                    center_x = (cand[0][0] + cand[-1][0]) / 2
+                    score = abs(center_x - target_center_x)
+                    if score < best_score:
+                        best_score = score
+                        best_cand = (cand, chunks)
+            if best_cand is not None:
+                break
+
+        if best_cand is None:
+            return None
+
+        cand, chunks = best_cand
+
+        for col_data, chunk in zip(cand, chunks):
+            x, top, bottom, _ = col_data
+            col_h = len(chunk) * size
+            start_y = top + (bottom - top - col_h) // 2
+            placements.append((chunk, x, start_y))
+
+    return placements
+
+
+def _largest_vertical_bbox_font_size(text: str, maximum: int, minimum: int, width: int, height: int) -> int | None:
+    """Find largest vertical font size that fits characters into a rectangular bounding box."""
+    characters = [character for character in text if character != "\n"]
+    if not characters:
+        return None
+    low = minimum
+    high = maximum
+    best: int | None = None
+    while low <= high:
+        size = (low + high) // 2
+        rows = max(1, height // size)
+        cols = (len(characters) + rows - 1) // rows
+        if cols * size <= width and size <= height:
+            best = size
+            low = size + 1
+        else:
+            high = size - 1
+    return best
+
+
 

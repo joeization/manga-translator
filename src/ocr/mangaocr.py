@@ -9,7 +9,7 @@ from PIL import Image
 
 from src.models import OCRResult
 
-from .region_splitter import crop_for_ocr, region_has_text, resolve_overlapping_regions, split_text_regions
+from .region_splitter import prepare_ocr_regions
 
 logger = logging.getLogger(__name__)
 
@@ -24,21 +24,10 @@ class MangaOCR:
 
     def detect(self, image: Image.Image) -> list[OCRResult]:
         engine = self._get_engine()
-        import numpy as np
-
-        image_array = np.asarray(image.convert("RGB"))
-        candidates = self._detector.detect(image)
-        all_split_regions: list[OCRResult] = []
-        for candidate in candidates:
-            region = candidate if isinstance(candidate, OCRResult) else OCRResult(bbox=candidate, source_text="")
-            all_split_regions.extend(split_text_regions(image, region, image_array=image_array))
-
-        all_split_regions = resolve_overlapping_regions(all_split_regions, threshold=0.35)
-        all_split_regions = [r for r in all_split_regions if region_has_text(image_array, r)]
+        all_split_regions, crops = prepare_ocr_regions(image, self._detector)
         if not all_split_regions:
             return []
 
-        crops = [crop_for_ocr(image, text_region) for text_region in all_split_regions]
         results = engine(crops)
         if isinstance(results, str):
             results = [results]

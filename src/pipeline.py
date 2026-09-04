@@ -64,7 +64,6 @@ def _restore_skipped_regions(
     """Restore original source text pixels for any OCR region skipped during translation.
 
     Ensures that untranslated or low-confidence text is never left as a blank erased hole,
-    preserving the original Japanese text and artwork from the source manga image.
     preserving the original source text and artwork from the input image.
     """
     if not skipped_regions or original_image is None:

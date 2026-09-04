@@ -15,44 +15,6 @@ class TextAnchorDetector(ABC):
         """Attach original source-text bounds to regions when they can be detected."""
 
 
-PUNCTUATION_VERTICAL_MAP: dict[str, str] = {
-    "！": "！",
-    "？": "？",
-    "…": "⋮",
-    "―": "︱",
-    "—": "︱",
-    "～": "︱",
-    "~": "︱",
-    "「": "﹁",
-    "」": "﹂",
-    "『": "﹃",
-    "』": "﹄",
-    "（": "︵",
-    "）": "︶",
-    "(": "︵",
-    ")": "︶",
-    "［": "﹇",
-    "］": "﹈",
-    "[": "﹇",
-    "]": "﹈",
-    "【": "︻",
-    "】": "︼",
-    "《": "︽",
-    "》": "︾",
-    "〈": "︿",
-    "〉": "﹀",
-    "、": "﹑",
-    "。": "◦",
-    ",": "﹑",
-    ".": "◦",
-}
-
-
-def to_vertical_text(text: str) -> str:
-    """Convert horizontal punctuation marks to vertical punctuation equivalents."""
-    return "".join(PUNCTUATION_VERTICAL_MAP.get(char, char) for char in text)
-
-
 class OpenCVInkAnchorDetector(TextAnchorDetector):
     def __init__(self, dark_threshold: int, border_margin: int) -> None:
         self._dark_threshold = dark_threshold

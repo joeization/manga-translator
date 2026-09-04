@@ -6,7 +6,13 @@ import numpy as np
 from PIL import Image
 
 from src.models import TextRegion
-from src.inpainting.utils import slice_mask_to_roi
+from src.inpainting.utils import (
+    UnionFind,
+    bbox_gap_2d,
+    partition_mask_by_centers,
+    reading_order_sort_key,
+    slice_mask_to_roi,
+)
 
 
 def crop_for_ocr(image: Image.Image, region: TextRegion) -> Image.Image:
@@ -38,19 +44,7 @@ def _cluster_components(
     in the same column/line and adjacent columns/lines within a single paragraph.
     """
     n = len(components)
-    parent = list(range(n))
-
-    def find(i: int) -> int:
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def union(i: int, j: int) -> None:
-        pi, pj = find(i), find(j)
-        if pi != pj:
-            parent[pj] = pi
-
+    uf = UnionFind(n)
     for i in range(n):
         li, ti, ri, bi, _ = components[i]
         for j in range(i + 1, n):
@@ -58,17 +52,126 @@ def _cluster_components(
             gap_x = max(0, max(li, lj) - min(ri, rj))
             gap_y = max(0, max(ti, tj) - min(bi, bj))
             if gap_x <= max_gap_x and gap_y <= max_gap_y:
-                union(i, j)
+                uf.union(i, j)
 
-    groups: dict[int, list[int]] = {}
-    for i in range(n):
-        root = find(i)
-        groups.setdefault(root, []).append(i)
-    return list(groups.values())
+    return list(uf.groups().values())
 
 
-def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.ndarray | None = None) -> list[TextRegion]:
-    """Cluster-based region splitter.
+def _split_2d_clusters(
+    region: TextRegion,
+    clusters: list[tuple[int, int, int, int]],
+    ink: np.ndarray,
+    median_w: float,
+    median_h: float,
+) -> list[TextRegion]:
+    """Split text region based on 2D Euclidean distance clustering and Voronoi mask partitioning.
+
+    Handles compound / stepped / diagonal speech bubbles where 1D orthogonal projections
+    overlap along both X and Y axes.
+    """
+    k = len(clusters)
+    if k <= 1:
+        return [region]
+
+    # Minimum required Euclidean gap to consider two clusters as physically distinct chambers/lobes
+    min_2d_gap = max(20.0, min(median_w, median_h) * 1.0)
+
+    uf = UnionFind(k)
+    for i in range(k):
+        for j in range(i + 1, k):
+            _, _, dist_2d = bbox_gap_2d(clusters[i], clusters[j])
+            if dist_2d < min_2d_gap:
+                uf.union(i, j)
+
+    groups_map = uf.groups()
+    if len(groups_map) <= 1:
+        return [region]
+
+    group_indices = list(groups_map.values())
+    left, top, right, bottom = region.bbox
+    w_region, h_region = right - left, bottom - top
+
+    # Group composite bounding boxes (relative to region.bbox)
+    group_boxes: list[tuple[int, int, int, int]] = []
+    for g_idxs in group_indices:
+        gl = min(clusters[i][0] for i in g_idxs)
+        gt = min(clusters[i][1] for i in g_idxs)
+        gr = max(clusters[i][2] for i in g_idxs)
+        gb = max(clusters[i][3] for i in g_idxs)
+        group_boxes.append((gl, gt, gr, gb))
+
+    # Determine layout mask baseline
+    if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
+        base_box = region.layout_bbox
+        base_mask = region.layout_mask
+    else:
+        base_box = region.bbox
+        base_mask = _mask_in_region(region)
+
+    # Group centers relative to base_box
+    group_centers = [
+        (
+            float((left + (gl + gr) / 2.0) - base_box[0]),
+            float((top + (gt + gb) / 2.0) - base_box[1]),
+        )
+        for gl, gt, gr, gb in group_boxes
+    ]
+
+    partitions = partition_mask_by_centers(base_mask, group_centers)
+
+    pad_x = max(2, int(median_w * 0.25))
+    pad_y = max(2, int(median_h * 0.25))
+
+    sub_regions: list[TextRegion] = []
+    for idx, (gl, gt, gr, gb) in enumerate(group_boxes):
+        gl_p = max(0, gl - pad_x)
+        gt_p = max(0, gt - pad_y)
+        gr_p = min(w_region, gr + pad_x)
+        gb_p = min(h_region, gb + pad_y)
+
+        sub_box = (left + gl_p, top + gt_p, left + gr_p, top + gb_p)
+        sub_ocr_mask = ink[gt_p:gb_p, gl_p:gr_p].astype(bool)
+
+        part = partitions[idx]
+        if part is not None:
+            (lx, ly, rx, by), cropped_chamber = part
+            sub_layout_bbox = (base_box[0] + lx, base_box[1] + ly, base_box[0] + rx, base_box[1] + by)
+            sub_layout_mask = cropped_chamber
+        else:
+            sub_layout_bbox = sub_box
+            sub_layout_mask = np.ones((sub_box[3] - sub_box[1], sub_box[2] - sub_box[0]), dtype=np.uint8)
+
+        sub_regions.append(
+            replace(
+                region,
+                bbox=sub_box,
+                source_bbox=sub_box,
+                ocr_mask=sub_ocr_mask,
+                layout_bbox=sub_layout_bbox,
+                layout_mask=sub_layout_mask,
+            )
+        )
+
+    # Sort sub-regions in reading order: top-to-bottom bands, then right-to-left
+    band_h = max(25.0, median_h * 1.5)
+    sub_regions.sort(
+        key=lambda r: reading_order_sort_key(
+            (r.bbox[0] + r.bbox[2]) / 2.0,
+            (r.bbox[1] + r.bbox[3]) / 2.0,
+            band_h,
+        )
+    )
+
+    return sub_regions
+
+
+def split_text_regions(
+    image: Image.Image,
+    region: TextRegion,
+    image_array: np.ndarray | None = None,
+    gray_image: np.ndarray | None = None,
+) -> list[TextRegion]:
+    """Segment a compound speech bubble into discrete semantic text chunks.
 
     Splits only when clear large interior blank gaps exist between distinct
     speech bubbles or paragraphs, while strictly preserving multi-column vertical
@@ -80,10 +183,13 @@ def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.n
         return [region]
 
     bubble_mask = _mask_in_region(region)
-    if image_array is None:
-        image_array = np.asarray(image.convert("RGB"))
-    pixels = image_array[top:bottom, left:right]
-    gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
+    if gray_image is not None:
+        gray = gray_image[top:bottom, left:right]
+    else:
+        if image_array is None:
+            image_array = np.asarray(image.convert("RGB"))
+        pixels = image_array[top:bottom, left:right]
+        gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
     _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     ink = np.where(bubble_mask, ink, 0).astype(np.uint8)
 
@@ -167,7 +273,7 @@ def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.n
 
         return split_pts
 
-    # 1. Attempt Y split
+    # 1. Attempt orthogonal 1D Y-axis split
     y_pts = split_axis(valid_clusters, axis=1, total_size=h_region, min_gap=min_y_gap, min_sub_size=min_sub_h)
     if y_pts:
         y_bounds = [0] + y_pts + [h_region]
@@ -189,7 +295,7 @@ def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.n
     else:
         y_parts = [(region, ink, valid_clusters)]
 
-    # 2. For each Y sub-region, independently attempt an X-axis split if multiple clusters exist
+    # 2. For each Y sub-region, attempt orthogonal 1D X-axis split, or 2D cluster split for non-orthogonal clusters
     result: list[TextRegion] = []
     for y_sub, y_ink, sub_c in y_parts:
         if len(sub_c) <= 1:
@@ -203,9 +309,20 @@ def split_text_regions(image: Image.Image, region: TextRegion, image_array: np.n
             for i in range(len(x_bounds) - 1):
                 x0, x1 = x_bounds[i], x_bounds[i + 1]
                 sub_box = (ys_left + x0, ys_top, ys_left + x1, ys_bottom)
-                result.append(replace(y_sub, bbox=sub_box, source_bbox=sub_box, ocr_mask=y_ink[:, x0:x1].astype(bool)))
+                sub_c_in_x = [
+                    (cl - x0, ct, cr - x0, cb)
+                    for cl, ct, cr, cb in sub_c
+                    if cl < x1 and cr > x0
+                ]
+                sub_ink_x = y_ink[:, x0:x1]
+                sub_part = replace(y_sub, bbox=sub_box, source_bbox=sub_box, ocr_mask=sub_ink_x.astype(bool))
+                if len(sub_c_in_x) >= 2:
+                    result.extend(_split_2d_clusters(sub_part, sub_c_in_x, sub_ink_x, median_w, median_h))
+                else:
+                    result.append(sub_part)
         else:
-            result.append(y_sub)
+            # Orthogonal 1D splitting cannot separate remaining clusters (e.g. diagonal/stepped bubbles)
+            result.extend(_split_2d_clusters(y_sub, sub_c, y_ink, median_w, median_h))
 
     return result
 
@@ -243,19 +360,7 @@ def resolve_overlapping_regions(regions: list[TextRegion], threshold: float = 1.
         return inter / areas[i]
 
     # Union-find (merge groups).
-    parent = list(range(n))
-
-    def _find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def _union(x: int, y: int) -> None:
-        px, py = _find(x), _find(y)
-        if px != py:
-            parent[py] = px  # merge y's root into x's root
-
+    uf = UnionFind(n)
     dominated: set[int] = set()
 
     for i in range(n):
@@ -273,15 +378,10 @@ def resolve_overlapping_regions(regions: list[TextRegion], threshold: float = 1.
                 break
             # areas[j] <= areas[i]: check symmetric overlap.
             if _overlap_frac(j, i) >= threshold:
-                _union(i, j)
+                uf.union(i, j)
 
     # Group surviving regions by union-find root.
-    groups: dict[int, list[int]] = {}
-    for i in range(n):
-        if i in dominated:
-            continue
-        root = _find(i)
-        groups.setdefault(root, []).append(i)
+    groups = uf.groups(active_indices={i for i in range(n) if i not in dominated})
 
     result: list[TextRegion] = []
     for members in groups.values():
@@ -304,9 +404,7 @@ def resolve_overlapping_regions(regions: list[TextRegion], threshold: float = 1.
             inter_w = max(0, min(r1, r2) - max(l1, l2))
             inter_h = max(0, min(b1, b2) - max(t1, t2))
             if inter_w > 0 and inter_h > 0:
-                v_overlap = max(0, min(b1, b2) - max(t1, t2))
-                h_overlap = max(0, min(r1, r2) - max(l1, l2))
-                if v_overlap >= h_overlap:
+                if inter_h >= inter_w:
                     x_sep = (max(l1, l2) + min(r1, r2)) // 2
                     if (l1 + r1) <= (l2 + r2):
                         result[i] = replace(result[i], bbox=(l1, t1, min(r1, x_sep), b1))
@@ -326,7 +424,12 @@ def resolve_overlapping_regions(regions: list[TextRegion], threshold: float = 1.
     return result
 
 
-def region_has_text(image_array: np.ndarray, region: TextRegion, min_char_area: int = 14) -> bool:
+def region_has_text(
+    image_array: np.ndarray,
+    region: TextRegion,
+    min_char_area: int = 14,
+    gray_image: np.ndarray | None = None,
+) -> bool:
     """Pre-OCR verification: determine whether a region contains actual text strokes.
 
     Discards empty speech bubbles, screentones, and circular background objects
@@ -337,8 +440,11 @@ def region_has_text(image_array: np.ndarray, region: TextRegion, min_char_area: 
     if w < 6 or h < 6:
         return False
 
-    roi = image_array[t:b, l:r]
-    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+    if gray_image is not None:
+        gray = gray_image[t:b, l:r]
+    else:
+        roi = image_array[t:b, l:r]
+        gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
 
     if isinstance(region.layout_mask, np.ndarray) and region.layout_bbox is not None:
         mask = slice_mask_to_roi((l, t, r, b), region.layout_bbox, region.layout_mask)
@@ -374,3 +480,26 @@ def region_has_text(image_array: np.ndarray, region: TextRegion, min_char_area: 
             return True
 
     return False
+
+def prepare_ocr_regions(
+    image: Image.Image,
+    detector: object,
+    image_array: np.ndarray | None = None,
+) -> tuple[list[TextRegion], list[Image.Image]]:
+    """Detect, split, resolve overlaps, filter empty bubbles, and generate crops for OCR."""
+    if image_array is None:
+        image_array = np.asarray(image.convert("RGB"))
+    gray_image = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+    candidates = detector.detect(image)
+    all_split_regions: list[TextRegion] = []
+    for candidate in candidates:
+        region = candidate if isinstance(candidate, TextRegion) else TextRegion(bbox=candidate, source_text="")
+        all_split_regions.extend(split_text_regions(image, region, image_array=image_array, gray_image=gray_image))
+
+    all_split_regions = resolve_overlapping_regions(all_split_regions, threshold=0.35)
+    all_split_regions = [r for r in all_split_regions if region_has_text(image_array, r, gray_image=gray_image)]
+    if not all_split_regions:
+        return [], []
+
+    crops = [crop_for_ocr(image, text_region) for text_region in all_split_regions]
+    return all_split_regions, crops

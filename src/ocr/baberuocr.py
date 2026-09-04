@@ -29,7 +29,7 @@ from src.models import OCRResult
 from .baberu.configuration_baberu import BaberuOCRConfig
 from .baberu.modeling_baberu import BaberuOCRModel
 from .baberu.tokenization_baberu import BaberuTokenizer
-from .region_splitter import crop_for_ocr, region_has_text, resolve_overlapping_regions, split_text_regions
+from .region_splitter import prepare_ocr_regions
 
 logger = logging.getLogger(__name__)
 
@@ -40,18 +40,17 @@ class CapContentRun(LogitsProcessor):
         self._max_run = max_run
 
     def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        seq_len = input_ids.shape[1]
+        if seq_len < self._max_run:
+            return scores
+
+        # Vectorized slice transfer to avoid per-element CUDA synchronization stalls
+        tail = input_ids[:, -self._max_run:].cpu()
         for batch_index in range(input_ids.shape[0]):
-            token_id = int(input_ids[batch_index, -1])
-            if token_id not in self._content_ids:
-                continue
-            run_length = 0
-            for position in range(input_ids.shape[1] - 1, -1, -1):
-                if int(input_ids[batch_index, position]) != token_id:
-                    break
-                run_length += 1
-                if run_length >= self._max_run:
+            token_id = int(tail[batch_index, -1])
+            if token_id in self._content_ids:
+                if (tail[batch_index] == token_id).all():
                     scores[batch_index, token_id] = float("-inf")
-                    break
         return scores
 
 
@@ -70,21 +69,10 @@ class BaberuOCR:
 
     def detect(self, image: Image.Image) -> list[OCRResult]:
         self._get_engine()
-        import numpy as np
-
-        image_array = np.asarray(image.convert("RGB"))
-        candidates = self._detector.detect(image)
-        all_split_regions: list[OCRResult] = []
-        for candidate in candidates:
-            region = candidate if isinstance(candidate, OCRResult) else OCRResult(bbox=candidate, source_text="")
-            all_split_regions.extend(split_text_regions(image, region, image_array=image_array))
-
-        all_split_regions = resolve_overlapping_regions(all_split_regions, threshold=0.35)
-        all_split_regions = [r for r in all_split_regions if region_has_text(image_array, r)]
+        all_split_regions, crops = prepare_ocr_regions(image, self._detector)
         if not all_split_regions:
             return []
 
-        crops = [crop_for_ocr(image, text_region) for text_region in all_split_regions]
         recognitions = self._recognize_all(crops)
 
         regions: list[OCRResult] = []
@@ -163,7 +151,7 @@ class BaberuOCR:
         assert self._image_processor is not None
         assert self._device is not None
 
-        rgb_images = [image.convert("RGB") for image in images]
+        rgb_images = [img if img.mode == "RGB" else img.convert("RGB") for img in images]
         pixel_values = self._image_processor(rgb_images, return_tensors="pt")["pixel_values"].to(
             self._device, dtype=self._model.dtype
         )
