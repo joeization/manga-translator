@@ -42,10 +42,10 @@ class MangaTranslationPipelineTests(unittest.TestCase):
 
     def test_low_confidence_region_is_not_a_translation_candidate(self) -> None:
         # Vertically separated so reading order is deterministic (top-to-bottom).
-        low_confidence = TextRegion((0, 0, 50, 50), "uncertain", confidence=0.42)
-        high_confidence = TextRegion((0, 60, 50, 110), "reliable", confidence=0.90)
-        another_high_confidence = TextRegion((0, 120, 50, 170), "reliable", confidence=0.96)
-        unavailable_confidence = TextRegion((0, 180, 50, 230), "unknown")
+        low_confidence = TextRegion((0, 0, 50, 50), "LOW_CONF", confidence=0.42)
+        high_confidence = TextRegion((0, 60, 50, 110), "HIGH_CONF_1", confidence=0.90)
+        another_high_confidence = TextRegion((0, 120, 50, 170), "HIGH_CONF_2", confidence=0.96)
+        unavailable_confidence = TextRegion((0, 180, 50, 230), "MIN_CONF")
 
         self.assertEqual(
             _translation_candidates([low_confidence, high_confidence, another_high_confidence, unavailable_confidence]),
@@ -66,7 +66,7 @@ class MangaTranslationPipelineTests(unittest.TestCase):
 
         hallucinated_region = TextRegion(
             (0, 0, 10, 10),
-            "hallucination",
+            "LOW_CONF",
             confidence=sentence_conf,
             character_confidences=uneven_char_confidences,
         )
@@ -84,7 +84,7 @@ class MangaTranslationPipelineTests(unittest.TestCase):
 
         good_region = TextRegion(
             (0, 0, 10, 10),
-            "reliable",
+            "HIGH_CONF",
             confidence=sentence_conf,
             character_confidences=consistent_char_confidences,
         )
@@ -163,7 +163,7 @@ class MangaTranslationPipelineTests(unittest.TestCase):
         rendered_img = Image.fromarray(rend_arr)
 
         # Skipped region covering (10, 10, 30, 30)
-        skipped_reg = TextRegion((10, 10, 30, 30), "skipped text")
+        skipped_reg = TextRegion((10, 10, 30, 30), "SKIPPED_TEXT")
         restored = _restore_skipped_regions(rendered_img, original_img, [skipped_reg], [])
 
         # Verify the blue patch from original_img was restored over the red patch
@@ -174,13 +174,13 @@ class MangaTranslationPipelineTests(unittest.TestCase):
         class _MultiOCR:
             def detect(self, image: Image.Image) -> list[TextRegion]:
                 return [
-                    TextRegion((0, 0, 20, 20), "good", confidence=0.95),
-                    TextRegion((50, 50, 70, 70), "skipped", confidence=0.10),
+                    TextRegion((0, 0, 20, 20), "GOOD_TEXT", confidence=0.95),
+                    TextRegion((50, 50, 70, 70), "SKIPPED_TEXT", confidence=0.10),
                 ]
 
         class _MockTranslator:
             def translate(self, texts: list[str], context: str | list[str] | None = None) -> list[str]:
-                return ["translated"] * len(texts)
+                return ["TRANS_TEXT"] * len(texts)
 
         class _MockInpainter:
             def inpaint(self, image: Image.Image, regions: list[TextRegion]) -> Image.Image:
@@ -214,7 +214,7 @@ class MangaTranslationPipelineTests(unittest.TestCase):
 
         result, regions = pipeline.process(orig)
         self.assertEqual(len(regions), 1)
-        self.assertEqual(regions[0].source_text, "good")
+        self.assertEqual(regions[0].source_text, "GOOD_TEXT")
 
         # The skipped region at (60, 60) must have its original black pixel restored from orig
         res_arr = np.array(result)

@@ -301,22 +301,29 @@ class PillowRenderer(Renderer):
         if has_alpha and not has_cjk:
             return True
 
+        # In vertical-rtl mode, speech bubbles (with layout_mask) are dialogue and must remain vertical.
+        if region.layout_mask is not None:
+            return False
+
+        # If CJK text is present without a layout_mask, only allow horizontal for wide banners (aspect ratio >= 2.0)
+        effective_threshold = max(2.0, aspect_ratio_threshold) if has_cjk else aspect_ratio_threshold
+
         bl, bt, br, bb = region.bbox
         bw = max(1, br - bl)
         bh = max(1, bb - bt)
 
-        if bw >= bh * aspect_ratio_threshold:
+        if bw >= bh * effective_threshold:
             return True
 
         if width is not None and height is not None and height > 0:
-            if width >= height * aspect_ratio_threshold and bw >= bh * 1.05:
+            if width >= height * effective_threshold and bw >= bh * 1.05:
                 return True
 
         if render_bounds is not None:
             rl, rt, rr, rb = render_bounds
             rw = max(1, rr - rl)
             rh = max(1, rb - rt)
-            if rw >= rh * aspect_ratio_threshold and bw >= bh * 1.05:
+            if rw >= rh * effective_threshold and bw >= bh * 1.05:
                 return True
 
         return False

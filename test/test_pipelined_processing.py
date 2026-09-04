@@ -26,12 +26,12 @@ class _MockItem:
 
 class _MockOCR:
     def detect(self, image: Image.Image) -> list[TextRegion]:
-        return [TextRegion((0, 0, 10, 10), "hello")]
+        return [TextRegion((0, 0, 10, 10), "SRC_TXT")]
 
 
 class _MockTranslator:
     def translate(self, texts: list[str], context: str | list[str] | None = None) -> list[str]:
-        return [f"trans:{t}" for t in texts]
+        return [f"TRANS:{t}" for t in texts]
 
 
 class _MockAnchorDetector:
@@ -88,7 +88,7 @@ class PipelinedProcessingTests(unittest.TestCase):
             # Check renderer modified pixel (0,0)
             self.assertEqual(trans.getpixel((0, 0)), (123, 123, 123))
             self.assertEqual(len(regions), 1)
-            self.assertEqual(regions[0].translated_text, "trans:hello")
+            self.assertEqual(regions[0].translated_text, "TRANS:SRC_TXT")
 
     def test_pipelined_handles_stage_failure_cleanly(self) -> None:
         ocr = _FailingOCR(fail_names={"page_1.jpg"})

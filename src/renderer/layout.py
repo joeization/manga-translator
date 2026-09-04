@@ -34,6 +34,11 @@ LINE_START_PROHIBITED = CLOSING_PUNCTUATION | SENTENCE_TERMINALS | set(
 LINE_END_PROHIBITED = OPENING_PUNCTUATION
 
 
+def is_latin_word_char(c: str) -> bool:
+    """Return True if character is a Latin/alphanumeric word character that should not be split across lines."""
+    return ("a" <= c <= "z") or ("A" <= c <= "Z") or ("0" <= c <= "9") or c in "'-_"
+
+
 
 @dataclass(frozen=True)
 class TextSegment:
@@ -163,6 +168,10 @@ class TextAutoLayout:
         orientation: str = "vertical-rtl",
         font_resolver: Callable[[int], ImageFont.FreeTypeFont] | None = None,
     ) -> None:
+        # Normalize whitespace in short numbers/titles (e.g. "第 3 話" -> "第3話", "第 1 卷" -> "第1卷")
+        clean = [c for c in text if not c.isspace()]
+        if len(clean) <= 4 and bool(re.search(r"[\u4e00-\u9fff\d]", text)):
+            text = "".join(clean)
         self.raw_text = text
         self.orientation = orientation
         self.font_resolver = font_resolver
@@ -488,9 +497,9 @@ class TextAutoLayout:
         chars = list(text)
         total_chars = len(chars)
 
-        # In vertical layout, never split short phrases (<= 3 chars) across multiple columns
+        # In vertical layout, never split short phrases (<= 4 chars) across multiple columns
         if self.orientation == "vertical-rtl":
-            if total_chars <= 3 or (total_chars / num_chunks) < 1.5:
+            if total_chars <= 4 or (total_chars / num_chunks) < 1.5:
                 return [text]
 
         target_chunk_len = total_chars / num_chunks
@@ -507,12 +516,33 @@ class TextAutoLayout:
             while next_idx > cur_idx + 1 and chars[next_idx - 1] in LINE_END_PROHIBITED:
                 next_idx -= 1
 
+            # 3. Whole-word boundary protection: never break inside an alphanumeric Latin/English word (e.g. "Windows")
+            if next_idx < total_chars and cur_idx < next_idx:
+                if is_latin_word_char(chars[next_idx - 1]) and is_latin_word_char(chars[next_idx]):
+                    word_start = next_idx - 1
+                    while word_start > cur_idx and is_latin_word_char(chars[word_start - 1]):
+                        word_start -= 1
+                    if word_start > cur_idx:
+                        next_idx = word_start
+
             chunk = "".join(chars[cur_idx:next_idx])
             while len(chunk) > 1 and measure_func(chunk) > line_limit:
                 next_idx -= 1
+                if next_idx < total_chars and cur_idx < next_idx:
+                    if is_latin_word_char(chars[next_idx - 1]) and is_latin_word_char(chars[next_idx]):
+                        word_start = next_idx - 1
+                        while word_start > cur_idx and is_latin_word_char(chars[word_start - 1]):
+                            word_start -= 1
+                        if word_start > cur_idx:
+                            next_idx = word_start
                 while next_idx > cur_idx + 1 and chars[next_idx - 1] in LINE_END_PROHIBITED:
                     next_idx -= 1
                 chunk = "".join(chars[cur_idx:next_idx])
+
+            if next_idx < total_chars and chars[next_idx - 1] in LINE_END_PROHIBITED:
+                next_idx += 1
+                chunk = "".join(chars[cur_idx:next_idx])
+
             chunks.append(chunk)
             cur_idx = next_idx
             if cur_idx >= total_chars:
@@ -567,6 +597,13 @@ class TextAutoLayout:
         broken_mid_sentence = len(lines) - unbroken_sentences
         score -= broken_mid_sentence * 35.0
 
+        # 6. Latin word integrity: reject layouts where an alphanumeric word was split across lines
+        for idx in range(len(lines) - 1):
+            line_a = lines[idx].text
+            line_b = lines[idx + 1].text
+            if line_a and line_b and is_latin_word_char(line_a[-1]) and is_latin_word_char(line_b[0]):
+                return -100000.0
+
         return score
 
     def _score_vertical(
@@ -585,6 +622,13 @@ class TextAutoLayout:
             return -100000.0 - (overflow_w + overflow_h) * 100.0
 
         score = 0.0
+
+        # Latin word integrity: reject layouts where an alphanumeric word was split across columns
+        for idx in range(len(columns) - 1):
+            col_a = columns[idx].text
+            col_b = columns[idx + 1].text
+            if col_a and col_b and is_latin_word_char(col_a[-1]) and is_latin_word_char(col_b[0]):
+                return -100000.0
 
         # In vertical typography, short phrases (<= 3 chars, e.g. "当然", "好的") must NEVER be split
         # into multiple 1-character columns (which turns vertical text into backward horizontal RTL "然 当").
@@ -683,41 +727,112 @@ def _mask_column_ranges(mask: np.ndarray, size: int, padding: int) -> list[tuple
 
 
 def _split_chars_by_capacity(chars: list[str], caps: list[int]) -> list[str] | None:
-    if sum(caps) < len(chars):
-        return None
+    n = len(chars)
     k = len(caps)
-    if k == 0:
+    if k == 0 or sum(caps) < n:
         return None
     if k == 1:
-        return ["".join(chars)] if caps[0] >= len(chars) else None
+        return ["".join(chars)] if caps[0] >= n else None
 
-    # In vertical layout, never split short phrases (<= 3 chars) across multiple columns
-    if len(chars) <= 3 and k > 1:
+    # In vertical layout, never split short phrases (<= 4 chars) across multiple columns
+    if n <= 4 and k > 1:
         return None
 
-    # Evenly distribute characters across columns without exceeding any column's capacity
-    chunks: list[str] = []
-    cur = 0
-    rem_chars = len(chars)
-    rem_cap = sum(caps)
+    def can_break_at(pos: int) -> bool:
+        if pos <= 0 or pos >= n:
+            return False
+        # Cannot break inside Latin word
+        if is_latin_word_char(chars[pos - 1]) and is_latin_word_char(chars[pos]):
+            return False
+        # Next line cannot start with line-start prohibited char
+        if chars[pos] in LINE_START_PROHIBITED:
+            return False
+        # Current line cannot end with line-end prohibited char
+        if chars[pos - 1] in LINE_END_PROHIBITED:
+            return False
+        return True
 
-    for i in range(k):
-        cap = caps[i]
-        rem_cols = k - i
-        ideal = round(rem_chars / rem_cols)
-        take = min(cap, ideal)
-        rem_after_cap = rem_cap - cap
-        if rem_chars - take > rem_after_cap:
-            take = rem_chars - rem_after_cap
+    suffix_caps = [0] * (k + 1)
+    for i in range(k - 1, -1, -1):
+        suffix_caps[i] = suffix_caps[i + 1] + caps[i]
 
-        if take > cap or take <= 0:
+    memo: dict[tuple[int, int], tuple[float, list[int]] | None] = {}
+
+    def solve(char_idx: int, col_idx: int) -> tuple[float, list[int]] | None:
+        state = (char_idx, col_idx)
+        if state in memo:
+            return memo[state]
+
+        rem_chars = n - char_idx
+        rem_cap = suffix_caps[col_idx]
+        if rem_chars > rem_cap:
+            memo[state] = None
             return None
 
-        chunks.append("".join(chars[cur : cur + take]))
-        cur += take
-        rem_chars -= take
-        rem_cap -= cap
+        if col_idx == k - 1:
+            if 0 < rem_chars <= caps[col_idx]:
+                ideal = n / k
+                cost = (rem_chars - ideal) ** 2
+                res = (cost, [n])
+                memo[state] = res
+                return res
+            memo[state] = None
+            return None
 
+        rem_cols = k - col_idx
+        ideal = rem_chars / rem_cols
+        best: tuple[float, list[int]] | None = None
+
+        min_take = max(1, rem_chars - suffix_caps[col_idx + 1])
+        max_take = min(caps[col_idx], rem_chars - (rem_cols - 1))
+        candidates = sorted(range(min_take, max_take + 1), key=lambda t: abs(t - ideal))
+
+        # Pass 1: strictly valid breakpoints (avoid Latin word break & Kinsoku rules)
+        for take in candidates:
+            next_pos = char_idx + take
+            if not can_break_at(next_pos):
+                continue
+            sub = solve(next_pos, col_idx + 1)
+            if sub is not None:
+                cost = (take - ideal) ** 2 + sub[0]
+                if best is None or cost < best[0]:
+                    best = (cost, [next_pos] + sub[1])
+
+        # Pass 2: soft breaks (still strictly avoiding Latin word breaks)
+        if best is None:
+            for take in candidates:
+                next_pos = char_idx + take
+                if is_latin_word_char(chars[next_pos - 1]) and is_latin_word_char(chars[next_pos]):
+                    continue
+                sub = solve(next_pos, col_idx + 1)
+                if sub is not None:
+                    cost = 1000.0 + (take - ideal) ** 2 + sub[0]
+                    if best is None or cost < best[0]:
+                        best = (cost, [next_pos] + sub[1])
+
+        # Pass 3: fallback if impossible
+        if best is None:
+            for take in candidates:
+                next_pos = char_idx + take
+                sub = solve(next_pos, col_idx + 1)
+                if sub is not None:
+                    cost = 10000.0 + (take - ideal) ** 2 + sub[0]
+                    if best is None or cost < best[0]:
+                        best = (cost, [next_pos] + sub[1])
+
+        memo[state] = best
+        return best
+
+    res = solve(0, 0)
+    if res is None:
+        return None
+
+    breaks = res[1]
+    chunks: list[str] = []
+    prev = 0
+    for b in breaks:
+        chunks.append("".join(chars[prev:b]))
+        prev = b
     return chunks
 
 
@@ -975,8 +1090,12 @@ def _vertical_mask_layout(
         target_center_x = (group[0][0] + group[-1][0]) / 2
         best_cand: tuple[list[tuple[int, int, int, int]], list[str]] | None = None
         best_score = float("inf")
-        # Short phrases (<= 3 chars) must always stay in 1 column
-        max_k = 1 if n_chars <= 3 else len(group)
+        # Short phrases (<= 4 chars) must always stay in 1 column
+        clean_non_space = [c for c in chars if not c.isspace()]
+        if len(clean_non_space) <= 4 and any(c.isalnum() for c in clean_non_space):
+            chars = clean_non_space
+            n_chars = len(chars)
+        max_k = 1 if n_chars <= 4 else len(group)
         for k in range(1, max_k + 1):
             for s_idx in range(len(group) - k + 1):
                 cand = group[s_idx : s_idx + k]

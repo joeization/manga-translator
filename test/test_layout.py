@@ -202,6 +202,46 @@ class TextLayoutTests(unittest.TestCase):
         self.assertGreater(max(ys), 180)
 
 
+    def test_mixed_script_vertical_layout_preserves_latin_words(self) -> None:
+        """CJK text containing Latin words must not break inside the Latin word under vertical layout."""
+        word = "WORD"
+        text = f"甲甲甲甲甲甲甲甲甲甲甲甲甲甲，乙乙乙乙乙{word}丙丙丙丙"
+        layout = TextAutoLayout(text, orientation="vertical-rtl", font_resolver=self._font_resolver)
+        res = layout.find_optimal_layout(available_width=440, available_height=300, min_font_size=12, preferred_font_size=28, max_font_size=72)
+        self.assertIsNotNone(res)
+        assert res is not None
+        # Check that Latin word is never split across lines
+        for line in res.lines:
+            if word in line:
+                continue
+            for prefix_len in range(1, len(word)):
+                prefix = word[:prefix_len]
+                self.assertFalse(
+                    line.endswith(prefix),
+                    f"Line '{line}' split '{word}' at '{prefix}'",
+                )
+
+    def test_split_chars_by_capacity_preserves_latin_words(self) -> None:
+        """_split_chars_by_capacity must not slice across Latin word boundaries."""
+        from src.renderer.layout import _split_chars_by_capacity
+        word = "WORD"
+        text = f"甲甲甲甲甲甲甲甲甲甲甲甲甲甲，乙乙乙乙乙{word}丙丙丙丙"
+        chars = list(text)
+        caps = [8, 8, 8, 8, 8, 8]
+        chunks = _split_chars_by_capacity(chars, caps)
+        self.assertIsNotNone(chunks)
+        assert chunks is not None
+        for chunk in chunks:
+            if word in chunk:
+                continue
+            for prefix_len in range(1, len(word)):
+                prefix = word[:prefix_len]
+                self.assertFalse(
+                    chunk.endswith(prefix),
+                    f"Chunk '{chunk}' split '{word}' at '{prefix}'",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
 
